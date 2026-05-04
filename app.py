@@ -1,108 +1,236 @@
 import streamlit as st
 import pandas as pd
-import fitz
-import base64
-import json
+import fitz, re, cv2, pytesseract, numpy as np
+from PIL import Image
 from io import BytesIO
-from openai import OpenAI
 
-st.set_page_config(page_title="Extraction Vision AI", layout="wide")
-st.title("Extraction pressiométrique par Vision AI")
+pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
+
+st.set_page_config(page_title="Extraction Pressiométrique", layout="wide")
+st.title("Extraction automatique PDF pressiométrique → Excel")
 
 uploaded = st.file_uploader("Importer PDF", type=["pdf"])
 
-api_key = st.secrets["OPENAI_API_KEY"]
-client = OpenAI(api_key=api_key)
+DEPTH_MAX = 15.0
 
-PROMPT = """
-Tu es un expert en extraction de coupes pressiométriques géotechniques.
+HEADER_BOX = (0.25, 0.11, 0.98, 0.26)
+LITHO_BOX  = (0.15, 0.28, 0.42, 0.90)
+PL_BOX     = (0.62, 0.28, 0.78, 0.90)   # bleu
+EM_BOX     = (0.81, 0.28, 0.97, 0.90)   # rouge à droite seulement
 
-Analyse cette page comme une image technique.
 
-Objectif : extraire un tableau propre.
+def crop(img, box):
+    w, h = img.size
+    return img.crop((int(w*box[0]), int(h*box[1]), int(w*box[2]), int(h*box[3])))
 
-Règles :
-- Lire le nom du sondage en haut, exemple SP_Reta043.
-- Lire X et Y en haut.
-- Lire Pl* en bleu.
-- Lire Em en rouge uniquement dans la colonne Em.
-- Ne jamais prendre Pf.
-- Lire la profondeur depuis l’axe vertical.
-- Associer chaque profondeur à la bonne lithologie selon les couches dessinées à gauche.
-- Utiliser la virgule comme séparateur décimal.
-- Retourner uniquement du JSON valide.
 
-Format :
-[
-  {
-    "Nom du sondages": "",
-    "x": "",
-    "y": "",
-    "Profondeur (m)": "",
-    "Lithologie": "",
-    "Pl* (MPa)": "",
-    "Em (MPa)": ""
-  }
-]
-"""
+def fr(x):
+    if x == "" or x is None:
+        return ""
+    return str(x).replace(".", ",")
 
-def page_to_base64(page):
-    pix = page.get_pixmap(matrix=fitz.Matrix(3, 3))
-    img_bytes = pix.tobytes("png")
-    return base64.b64encode(img_bytes).decode("utf-8")
 
-def extract_page(page):
-    b64 = page_to_base64(page)
+def snap_depth(d):
+    return round(round(d / 1.5) * 1.5, 1)
 
-    response = client.responses.create(
-        model="gpt-4.1",
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": PROMPT},
-                    {
-                        "type": "input_image",
-                        "image_url": f"data:image/png;base64,{b64}"
-                    }
-                ]
-            }
-        ]
+
+def clean_num(v):
+    return float(str(v).replace(",", "."))
+
+
+def keep_color(img, color):
+    arr = np.array(img.convert("RGB"))
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+
+    if color == "blue":
+        mask = cv2.inRange(hsv, np.array([90, 35, 35]), np.array([145, 255, 255]))
+    else:
+        m1 = cv2.inRange(hsv, np.array([0, 35, 35]), np.array([15, 255, 255]))
+        m2 = cv2.inRange(hsv, np.array([160, 35, 35]), np.array([180, 255, 255]))
+        mask = m1 + m2
+
+    result = np.ones_like(arr) * 255
+    result[mask > 0] = arr[mask > 0]
+    return Image.fromarray(result)
+
+
+def ocr_text(img):
+    return pytesseract.image_to_string(img, lang="fra+eng", config="--psm 6")
+
+
+def extract_header(img):
+    text = ocr_text(crop(img, HEADER_BOX))
+
+    sondage = ""
+    m = re.search(r"(SP\s*[_\-]?\s*[A-Za-z]+\s*[_\-]?\s*\d+)", text, re.I)
+    if m:
+        sondage = re.sub(r"\s+", "", m.group(1)).replace("-", "_")
+
+    coords = re.findall(r"\d{5,6}[.,]\d+", text)
+    x = fr(coords[0]) if len(coords) >= 1 else ""
+    y = fr(coords[1]) if len(coords) >= 2 else ""
+
+    return sondage, x, y
+
+
+def clean_litho(txt):
+    t = txt.lower()
+    t = t.replace("lerre", "terre").replace("tufcalcaire", "tuf calcaire")
+    t = t.replace("caleaire", "calcaire").replace("calcaïre", "calcaire")
+    t = t.replace("schiteuse", "schisteuse").replace("graniste", "granitique")
+
+    if "terre" in t:
+        return "Terre végétale"
+    if "tuf" in t and "calcaire" in t:
+        return "Tuf calcaire"
+    if "tuf" in t and "graveleux" in t:
+        return "Tuf graveleux"
+    if "calcaire" in t:
+        return "Calcaire dure"
+    if "schiste" in t:
+        return "Roche schisteuse dure"
+    if "granit" in t:
+        return "Roche granitique grise"
+    if "argile" in t:
+        return "Argile"
+    if "sable" in t:
+        return "Sable"
+    if "marne" in t:
+        return "Marne"
+    return ""
+
+
+def extract_lithologies(img):
+    text = ocr_text(crop(img, LITHO_BOX))
+    lines = [clean_litho(l) for l in text.split("\n")]
+    lines = [l for l in lines if l]
+
+    clean = []
+    for l in lines:
+        if l not in clean:
+            clean.append(l)
+
+    return clean
+
+
+def lithology_for_depth(depth, lithos):
+    if not lithos:
+        return ""
+    if len(lithos) == 1:
+        return lithos[0]
+    if depth <= 2.5:
+        return lithos[0]
+    return lithos[-1]
+
+
+def extract_values(img, box, color, vmin, vmax):
+    zone = crop(img, box)
+    zone = keep_color(zone, color)
+
+    df = pytesseract.image_to_data(
+        zone,
+        lang="eng",
+        config="--psm 6",
+        output_type=pytesseract.Output.DATAFRAME
     )
 
-    txt = response.output_text.strip()
-    txt = txt.replace("```json", "").replace("```", "").strip()
-    return json.loads(txt)
+    df = df.dropna(subset=["text"])
+    h = zone.size[1]
+    values = []
+
+    for _, r in df.iterrows():
+        txt = str(r["text"]).strip()
+        txt = txt.replace("O", "0").replace("o", "0").replace("|", "1").replace("l", "1")
+
+        nums = re.findall(r"\d+[.,]\d+|\d+", txt)
+
+        for n in nums:
+            try:
+                val = clean_num(n)
+            except:
+                continue
+
+            if vmin <= val <= vmax:
+                cy = r["top"] + r["height"] / 2
+                depth = snap_depth((cy / h) * DEPTH_MAX)
+
+                if 0 < depth <= DEPTH_MAX:
+                    values.append((depth, val))
+
+    values = sorted(values, key=lambda x: x[0])
+
+    final = {}
+    for d, v in values:
+        final[d] = v
+
+    return sorted(final.items())
+
+
+def merge_values(pls, ems):
+    rows = []
+    em_dict = dict(ems)
+
+    for d, pl in pls:
+        em = em_dict.get(d, "")
+        rows.append((d, pl, em))
+
+    return rows
+
 
 def make_excel(df):
-    out = BytesIO()
+    output = BytesIO()
 
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, startrow=1, sheet_name="Pressiometrique")
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        export = df[[
+            "Nom du sondages", "x", "y", "Profondeur (m)",
+            "Lithologie", "Pl* (MPa)", "Em (MPa)"
+        ]]
+
+        export.to_excel(writer, index=False, startrow=1, sheet_name="Pressiometrique")
         ws = writer.book["Pressiometrique"]
 
         ws.merge_cells("A1:D1")
         ws["A1"] = "Echantillon"
-
         ws.merge_cells("E1:G1")
         ws["E1"] = "Caracteristiques pressiometriques"
 
-    out.seek(0)
-    return out
+    output.seek(0)
+    return output
+
 
 if uploaded:
     if st.button("Extraire Excel"):
         doc = fitz.open(stream=uploaded.read(), filetype="pdf")
+        rows = []
 
-        all_rows = []
         progress = st.progress(0)
 
-        for i, page in enumerate(doc):
-            rows = extract_page(page)
-            all_rows.extend(rows)
-            progress.progress((i + 1) / len(doc))
+        for page_index, page in enumerate(doc):
+            pix = page.get_pixmap(matrix=fitz.Matrix(4, 4))
+            img = Image.open(BytesIO(pix.tobytes("png")))
 
-        df = pd.DataFrame(all_rows)
+            sondage, x, y = extract_header(img)
+            lithos = extract_lithologies(img)
+
+            pls = extract_values(img, PL_BOX, "blue", 0.1, 30)
+            ems = extract_values(img, EM_BOX, "red", 10, 20000)
+
+            merged = merge_values(pls, ems)
+
+            for i, (depth, pl, em) in enumerate(merged):
+                rows.append({
+                    "Nom du sondages": sondage,
+                    "x": x if i == 0 else "",
+                    "y": y if i == 0 else "",
+                    "Profondeur (m)": fr(depth),
+                    "Lithologie": lithology_for_depth(depth, lithos),
+                    "Pl* (MPa)": fr(round(pl, 3)),
+                    "Em (MPa)": fr(round(em, 1)) if em != "" else ""
+                })
+
+            progress.progress((page_index + 1) / len(doc))
+
+        df = pd.DataFrame(rows)
 
         st.dataframe(df, use_container_width=True)
 
@@ -111,6 +239,6 @@ if uploaded:
         st.download_button(
             "Télécharger Excel",
             excel,
-            "extraction_pressiometrique_ai.xlsx",
+            "extraction_pressiometrique.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
