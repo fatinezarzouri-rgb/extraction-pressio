@@ -3,3 +3,5 @@ pandas
 pymupdf
 pillow
 pytesseract
+openpyxl
+opencv-python-headless
