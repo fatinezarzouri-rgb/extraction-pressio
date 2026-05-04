@@ -2,9 +2,9 @@ import streamlit as st
 import pandas as pd
 import fitz
 import pytesseract
-import re
 import cv2
 import numpy as np
+import re
 from PIL import Image
 from io import BytesIO
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
@@ -18,11 +18,10 @@ uploaded = st.file_uploader("Importer le PDF", type=["pdf"])
 
 DEPTH_MAX = 15.0
 
-HEADER_BOX = (0.28, 0.12, 0.99, 0.26)
-LOG_BOX = (0.07, 0.28, 0.39, 0.90)
-LITHO_BOX = (0.16, 0.28, 0.40, 0.90)
-PL_BOX = (0.63, 0.28, 0.78, 0.90)
-EM_BOX = (0.80, 0.28, 0.97, 0.90)
+HEADER_BOX = (0.30, 0.13, 0.98, 0.25)
+LITHO_BOX = (0.18, 0.28, 0.40, 0.90)
+PL_BOX = (0.64, 0.28, 0.78, 0.90)
+EM_BOX = (0.82, 0.28, 0.97, 0.90)
 
 
 def crop(img, box):
@@ -31,7 +30,7 @@ def crop(img, box):
 
 
 def fr(x):
-    if x is None or x == "":
+    if x == "" or x is None:
         return ""
     return str(x).replace(".", ",")
 
@@ -41,6 +40,10 @@ def to_float(x):
         return float(str(x).replace(",", "."))
     except:
         return None
+
+
+def snap_depth(d):
+    return round(round(d / 1.5) * 1.5, 1)
 
 
 def ocr_text(img):
@@ -56,226 +59,121 @@ def ocr_data(img):
     )
 
 
-def clean_lithology(text):
-    text = str(text).lower()
-
-    text = text.replace("lerre", "terre")
-    text = text.replace("ierre", "terre")
-    text = text.replace("vegetale", "végétale")
-    text = text.replace("tufcalcaire", "tuf calcaire")
-    text = text.replace("caleaire", "calcaire")
-    text = text.replace("calcaïre", "calcaire")
-    text = text.replace("dure cr", "dure")
-    text = text.replace("dur cr", "dur")
-    text = text.replace("schiteuse", "schisteuse")
-    text = text.replace("graniste", "granitique")
-
-    text = re.sub(r"[^a-zA-Zéèêàùçîïôûâ\s]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-
-    if "terre" in text:
-        return "Terre végétale"
-    if "tuf" in text and "calcaire" in text:
-        return "Tuf calcaire"
-    if "tuf" in text and "graveleux" in text:
-        return "Tuf graveleux"
-    if "calcaire" in text and ("dur" in text or "dure" in text):
-        return "Calcaire dure"
-    if "calcaire" in text:
-        return "Calcaire"
-    if "schiste" in text:
-        return "Roche schisteuse dure"
-    if "granit" in text:
-        return "Roche granitique grise"
-    if "argile" in text and "matrice" in text:
-        return "Argile à matrice rocheuse"
-    if "sable" in text and "matrice" in text:
-        return "Sable à matrice rocheuse"
-    if "argile" in text:
-        return "Argile"
-    if "sable" in text:
-        return "Sable"
-    if "marne" in text:
-        return "Marne"
-    if "gres" in text or "grès" in text:
-        return "Grès"
-
-    return text.capitalize()
-
-
-def extract_header(img):
-    zone = crop(img, HEADER_BOX)
-    text = ocr_text(zone)
-
-    sondage = ""
-    x = ""
-    y = ""
-
-    m = re.search(r"SP\s*[_\-]?\s*Reta\s*[_\-]?\s*(\d+)", text, re.I)
-    if m:
-        sondage = "SP_Reta" + m.group(1).zfill(3)
-    else:
-        m2 = re.search(r"(SP\s*[_\-]?\s*[A-Za-z]+\s*[_\-]?\s*\d+)", text, re.I)
-        if m2:
-            sondage = re.sub(r"\s+", "", m2.group(1)).replace("-", "_")
-
-    coords = re.findall(r"\d{5,6}[.,]\d+", text)
-
-    if len(coords) >= 2:
-        x = fr(coords[0])
-        y = fr(coords[1])
-
-    return sondage, x, y
-
-
 def keep_color_only(img, color):
     arr = np.array(img.convert("RGB"))
     hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
 
     if color == "blue":
-        lower = np.array([90, 35, 35])
-        upper = np.array([145, 255, 255])
-        mask = cv2.inRange(hsv, lower, upper)
+        mask = cv2.inRange(hsv, np.array([90, 40, 40]), np.array([145, 255, 255]))
     else:
-        lower1 = np.array([0, 35, 35])
-        upper1 = np.array([15, 255, 255])
-        lower2 = np.array([160, 35, 35])
-        upper2 = np.array([180, 255, 255])
-        mask = cv2.inRange(hsv, lower1, upper1) + cv2.inRange(hsv, lower2, upper2)
+        mask1 = cv2.inRange(hsv, np.array([0, 40, 40]), np.array([15, 255, 255]))
+        mask2 = cv2.inRange(hsv, np.array([160, 40, 40]), np.array([180, 255, 255]))
+        mask = mask1 + mask2
 
     result = np.ones_like(arr) * 255
     result[mask > 0] = arr[mask > 0]
     return Image.fromarray(result)
 
 
-def get_axis_bounds(log_img):
-    return 0, log_img.size[1]
+def clean_lithology(t):
+    t = str(t).lower()
+    t = t.replace("lerre", "terre")
+    t = t.replace("tufcalcaire", "tuf calcaire")
+    t = t.replace("caleaire", "calcaire")
+    t = t.replace("calcaïre", "calcaire")
+    t = t.replace("schiteuse", "schisteuse")
+    t = t.replace("graniste", "granitique")
+    t = re.sub(r"[^a-zA-Zéèêàùçîïôûâ\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+
+    if "terre" in t:
+        return "Terre végétale"
+    if "tuf" in t and "calcaire" in t:
+        return "Tuf calcaire"
+    if "tuf" in t and "graveleux" in t:
+        return "Tuf graveleux"
+    if "calcaire" in t and ("dur" in t or "dure" in t):
+        return "Calcaire dure"
+    if "calcaire" in t:
+        return "Calcaire"
+    if "schiste" in t:
+        return "Roche schisteuse dure"
+    if "granit" in t:
+        return "Roche granitique grise"
+    if "argile" in t and "matrice" in t:
+        return "Argile à matrice rocheuse"
+    if "sable" in t and "matrice" in t:
+        return "Sable à matrice rocheuse"
+    if "argile" in t:
+        return "Argile"
+    if "sable" in t:
+        return "Sable"
+    if "marne" in t:
+        return "Marne"
+    return t.capitalize()
 
 
-def y_to_depth(y, top, bottom):
-    return ((y - top) / (bottom - top)) * DEPTH_MAX
+def extract_header(img):
+    text = ocr_text(crop(img, HEADER_BOX))
+
+    sondage = ""
+    m = re.search(r"SP\s*[_\-]?\s*Reta\s*[_\-]?\s*(\d+)", text, re.I)
+    if m:
+        sondage = "SP_Reta" + m.group(1).zfill(3)
+    else:
+        m = re.search(r"(SP\s*[_\-]?\s*[A-Za-z]+\s*[_\-]?\s*\d+)", text, re.I)
+        if m:
+            sondage = re.sub(r"\s+", "", m.group(1)).replace("-", "_")
+
+    coords = re.findall(r"\d{5,6}[.,]\d+", text)
+    x = fr(coords[0]) if len(coords) >= 1 else ""
+    y = fr(coords[1]) if len(coords) >= 2 else ""
+
+    return sondage, x, y
 
 
-def detect_layer_lines(log_img, top, bottom):
-    arr = np.array(log_img.convert("RGB"))
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+def extract_lithologies(img):
+    text = ocr_text(crop(img, LITHO_BOX))
+    lines = [clean_lithology(x) for x in text.split("\n") if len(x.strip()) > 2]
+    lines = [x for x in lines if x]
 
-    edges = cv2.Canny(gray, 50, 150)
-    lines = cv2.HoughLinesP(
-        edges,
-        1,
-        np.pi / 180,
-        threshold=70,
-        minLineLength=int(arr.shape[1] * 0.25),
-        maxLineGap=8
-    )
-
-    ys = [top, bottom]
-
-    if lines is not None:
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            if abs(y1 - y2) <= 4:
-                y = int((y1 + y2) / 2)
-                if top <= y <= bottom:
-                    ys.append(y)
-
-    ys = sorted(ys)
+    if not lines:
+        return []
 
     clean = []
-    for y in ys:
-        if not clean or abs(y - clean[-1]) > 25:
-            clean.append(y)
+    for l in lines:
+        if l not in clean:
+            clean.append(l)
 
     return clean
 
 
-def extract_lithology_texts(litho_img, top, bottom):
-    df = ocr_data(litho_img)
+def lithology_for_depth(depth, lithos):
+    if not lithos:
+        return ""
+
+    if len(lithos) == 1:
+        return lithos[0]
+
+    if depth <= 2.5:
+        return lithos[0]
+
+    return lithos[-1]
+
+
+def extract_values(img, box, color, vmin, vmax):
+    zone = crop(img, box)
+    color_zone = keep_color_only(zone, color)
+
+    df = ocr_data(color_zone)
     df = df.dropna(subset=["text"])
 
-    words = []
-
-    for _, r in df.iterrows():
-        txt = str(r["text"]).strip()
-        if len(txt) < 2:
-            continue
-        if not re.search(r"[A-Za-zéèêàùçîïôûâ]", txt):
-            continue
-        if txt.lower() in ["lithologie", "profondeur", "labotest", "m"]:
-            continue
-
-        cy = r["top"] + r["height"] / 2
-        depth = y_to_depth(cy, top, bottom)
-
-        if 0 <= depth <= DEPTH_MAX:
-            words.append((depth, txt))
-
-    words = sorted(words, key=lambda x: x[0])
-
-    groups = []
-    for depth, word in words:
-        if not groups or abs(depth - groups[-1]["depth"]) > 0.8:
-            groups.append({"depth": depth, "words": [word]})
-        else:
-            groups[-1]["words"].append(word)
-            groups[-1]["depth"] = (groups[-1]["depth"] + depth) / 2
-
-    return [{"depth": g["depth"], "text": clean_lithology(" ".join(g["words"]))} for g in groups]
-
-
-def build_layers(log_img, litho_img):
-    top, bottom = get_axis_bounds(log_img)
-    lines = detect_layer_lines(log_img, top, bottom)
-    litho_texts = extract_lithology_texts(litho_img, top, bottom)
-
-    layers = []
-
-    for i in range(len(lines) - 1):
-        y1 = lines[i]
-        y2 = lines[i + 1]
-
-        z1 = round(y_to_depth(y1, top, bottom), 2)
-        z2 = round(y_to_depth(y2, top, bottom), 2)
-        mid = (z1 + z2) / 2
-
-        litho = ""
-        if litho_texts:
-            nearest = min(litho_texts, key=lambda t: abs(t["depth"] - mid))
-            litho = nearest["text"]
-
-        if z2 > z1:
-            layers.append({
-                "z_debut": z1,
-                "z_fin": z2,
-                "lithologie": litho
-            })
-
-    return layers, top, bottom
-
-
-def lithology_at_depth(depth, layers):
-    for c in layers:
-        if c["z_debut"] <= depth <= c["z_fin"]:
-            return c["lithologie"]
-    return ""
-
-
-def extract_colored_values(zone_img, zone_box, color, vmin, vmax, page_img, axis_top_global, axis_bottom_global):
-    color_img = keep_color_only(zone_img, color)
-
-    df = ocr_data(color_img)
-    df = df.dropna(subset=["text"])
-
-    page_w, page_h = page_img.size
-    zone_y1 = int(page_h * zone_box[1])
-
+    h = color_zone.size[1]
     values = []
 
     for _, r in df.iterrows():
         txt = str(r["text"]).strip()
-        txt = txt.replace("O", "0").replace("o", "0")
-        txt = txt.replace("|", "1").replace("l", "1")
+        txt = txt.replace("O", "0").replace("o", "0").replace("|", "1").replace("l", "1")
 
         nums = re.findall(r"\d+[.,]\d+|\d+", txt)
 
@@ -285,35 +183,38 @@ def extract_colored_values(zone_img, zone_box, color, vmin, vmax, page_img, axis
                 continue
 
             if vmin <= val <= vmax:
-                cy_global = zone_y1 + r["top"] + r["height"] / 2
-                depth = y_to_depth(cy_global, axis_top_global, axis_bottom_global)
+                cy = r["top"] + r["height"] / 2
+                depth_raw = (cy / h) * DEPTH_MAX
+                depth = snap_depth(depth_raw)
 
-                if 0 <= depth <= DEPTH_MAX:
+                if 0 < depth <= DEPTH_MAX:
                     values.append({
-                        "depth": round(depth, 2),
+                        "depth": depth,
                         "value": val
                     })
 
     values = sorted(values, key=lambda x: x["depth"])
 
     clean = []
+    seen = set()
     for v in values:
-        if not clean or abs(v["depth"] - clean[-1]["depth"]) > 0.20:
+        if v["depth"] not in seen:
             clean.append(v)
+            seen.add(v["depth"])
 
     return clean
 
 
-def merge_pl_em(pl_values, em_values):
+def merge_pl_em(pls, ems):
     rows = []
     used = set()
 
-    for pl in pl_values:
+    for pl in pls:
         best_i = None
         best_em = None
         best_dist = 999
 
-        for i, em in enumerate(em_values):
+        for i, em in enumerate(ems):
             if i in used:
                 continue
             dist = abs(pl["depth"] - em["depth"])
@@ -324,54 +225,41 @@ def merge_pl_em(pl_values, em_values):
 
         if best_em is not None and best_dist <= 0.8:
             used.add(best_i)
-            depth = round((pl["depth"] + best_em["depth"]) / 2, 2)
-            rows.append({"depth": depth, "pl": pl["value"], "em": best_em["value"]})
+            rows.append({
+                "depth": pl["depth"],
+                "pl": pl["value"],
+                "em": best_em["value"]
+            })
         else:
-            rows.append({"depth": pl["depth"], "pl": pl["value"], "em": ""})
+            rows.append({
+                "depth": pl["depth"],
+                "pl": pl["value"],
+                "em": ""
+            })
 
     return rows
 
 
 def process_page(img, page_num):
     sondage, x, y = extract_header(img)
+    lithos = extract_lithologies(img)
 
-    log_img = crop(img, LOG_BOX)
-    litho_img = crop(img, LITHO_BOX)
-    pl_img = crop(img, PL_BOX)
-    em_img = crop(img, EM_BOX)
+    pls = extract_values(img, PL_BOX, "blue", 0.1, 30)
+    ems = extract_values(img, EM_BOX, "red", 1, 20000)
 
-    layers, axis_top_local, axis_bottom_local = build_layers(log_img, litho_img)
-
-    page_w, page_h = img.size
-    log_y1_global = int(page_h * LOG_BOX[1])
-
-    axis_top_global = log_y1_global + axis_top_local
-    axis_bottom_global = log_y1_global + axis_bottom_local
-
-    pl_values = extract_colored_values(
-        pl_img, PL_BOX, "blue", 0.1, 30,
-        img, axis_top_global, axis_bottom_global
-    )
-
-    em_values = extract_colored_values(
-        em_img, EM_BOX, "red", 10, 20000,
-        img, axis_top_global, axis_bottom_global
-    )
-
-    merged = merge_pl_em(pl_values, em_values)
+    rows_data = merge_pl_em(pls, ems)
 
     rows = []
-
-    for i, r in enumerate(merged):
-        depth = r["depth"]
+    for i, r in enumerate(rows_data):
+        d = r["depth"]
 
         rows.append({
             "Page PDF": page_num,
             "Nom du sondages": sondage,
             "x": x if i == 0 else "",
             "y": y if i == 0 else "",
-            "Profondeur (m)": fr(round(depth, 2)),
-            "Lithologie": lithology_at_depth(depth, layers),
+            "Profondeur (m)": fr(d),
+            "Lithologie": lithology_for_depth(d, lithos),
             "Pl* (MPa)": fr(round(r["pl"], 3)),
             "Em (MPa)": fr(round(r["em"], 1)) if r["em"] != "" else ""
         })
@@ -382,17 +270,15 @@ def process_page(img, page_num):
 def make_excel(df):
     out = BytesIO()
 
-    export = df[
-        [
-            "Nom du sondages",
-            "x",
-            "y",
-            "Profondeur (m)",
-            "Lithologie",
-            "Pl* (MPa)",
-            "Em (MPa)"
-        ]
-    ]
+    export = df[[
+        "Nom du sondages",
+        "x",
+        "y",
+        "Profondeur (m)",
+        "Lithologie",
+        "Pl* (MPa)",
+        "Em (MPa)"
+    ]]
 
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         export.to_excel(writer, index=False, startrow=1, sheet_name="Pressiometrique")
@@ -420,17 +306,7 @@ def make_excel(df):
             cell.fill = blue
             cell.font = Font(bold=True)
 
-        widths = {
-            "A": 18,
-            "B": 15,
-            "C": 15,
-            "D": 15,
-            "E": 35,
-            "F": 14,
-            "G": 14
-        }
-
-        for col, width in widths.items():
+        for col, width in {"A": 18, "B": 15, "C": 15, "D": 15, "E": 35, "F": 14, "G": 14}.items():
             ws.column_dimensions[col].width = width
 
     out.seek(0)
@@ -449,9 +325,7 @@ if uploaded:
                 pix = page.get_pixmap(matrix=fitz.Matrix(4, 4))
                 img = Image.open(BytesIO(pix.tobytes("png")))
 
-                rows = process_page(img, i + 1)
-                all_rows.extend(rows)
-
+                all_rows.extend(process_page(img, i + 1))
                 progress.progress((i + 1) / len(doc))
 
             df = pd.DataFrame(all_rows)
