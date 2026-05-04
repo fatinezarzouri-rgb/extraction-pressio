@@ -1,25 +1,21 @@
 import streamlit as st
 import pandas as pd
-import fitz
-import pytesseract
-import cv2
-import numpy as np
-import re
+import fitz, re, cv2, pytesseract, numpy as np
 from PIL import Image
 from io import BytesIO
 
 pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
-st.title("Extraction PDF pressiométrique → Excel")
+st.title("Extraction pressiométrique PDF → Excel")
 
-uploaded = st.file_uploader("Importer PDF", type=["pdf"])
+uploaded = st.file_uploader("Importer le PDF", type=["pdf"])
 
-DEPTHS = [1.5, 3, 4.5, 6, 7.5, 9, 10.5, 12, 13.5, 15]
-
-HEADER_BOX = (0.20, 0.08, 0.99, 0.30)
-LITHO_BOX  = (0.15, 0.28, 0.42, 0.90)
+HEADER_BOX = (0.18, 0.08, 0.99, 0.30)
+LITHO_BOX  = (0.14, 0.28, 0.42, 0.90)
 PL_BOX     = (0.62, 0.28, 0.78, 0.90)
-EM_BOX     = (0.79, 0.28, 0.98, 0.90)
+EM_BOX     = (0.78, 0.28, 0.99, 0.90)
+
+DEPTH_MAX = 15.0
 
 
 def crop(img, box):
@@ -27,15 +23,15 @@ def crop(img, box):
     return img.crop((int(w*box[0]), int(h*box[1]), int(w*box[2]), int(h*box[3])))
 
 
-def fr(x):
-    if x == "" or x is None:
+def fr(v):
+    if v == "" or v is None:
         return ""
-    return str(x).replace(".", ",")
+    return str(v).replace(".", ",")
 
 
-def to_float(x):
+def to_float(v):
     try:
-        return float(str(x).replace(",", "."))
+        return float(str(v).replace(",", "."))
     except:
         return None
 
@@ -44,30 +40,29 @@ def snap_depth(d):
     return round(round(d / 1.5) * 1.5, 1)
 
 
-def ocr(img, psm=6):
-    return pytesseract.image_to_string(img, lang="fra+eng", config=f"--psm {psm}")
-
-
-def color_only(img, color):
+def color_bw(img, color):
     arr = np.array(img.convert("RGB"))
     hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
 
     if color == "blue":
-        mask = cv2.inRange(hsv, np.array([90, 40, 40]), np.array([145, 255, 255]))
+        mask = cv2.inRange(hsv, np.array([90, 35, 35]), np.array([145, 255, 255]))
     else:
-        m1 = cv2.inRange(hsv, np.array([0, 40, 40]), np.array([15, 255, 255]))
-        m2 = cv2.inRange(hsv, np.array([160, 40, 40]), np.array([180, 255, 255]))
+        m1 = cv2.inRange(hsv, np.array([0, 35, 35]), np.array([15, 255, 255]))
+        m2 = cv2.inRange(hsv, np.array([160, 35, 35]), np.array([180, 255, 255]))
         mask = m1 + m2
 
     out = np.ones(mask.shape, dtype=np.uint8) * 255
     out[mask > 0] = 0
     out = cv2.dilate(out, np.ones((2, 2), np.uint8), iterations=1)
-
     return Image.fromarray(out)
 
 
+def ocr_text(img, psm=6):
+    return pytesseract.image_to_string(img, lang="fra+eng", config=f"--psm {psm}")
+
+
 def extract_header(img):
-    text = ocr(crop(img, HEADER_BOX), 6)
+    text = ocr_text(crop(img, HEADER_BOX), 6)
 
     m = re.search(r"(SP\s*[_\-]?\s*[A-Za-z]+\s*[_\-]?\s*\d+)", text, re.I)
     sondage = ""
@@ -76,19 +71,23 @@ def extract_header(img):
         sondage = sondage.replace("_0", "0")
 
     coords = re.findall(r"\d{3}\s?\d{3}[.,]\d+", text)
-    x = coords[0].replace(" ", "").replace(".", ",") if len(coords) > 0 else ""
-    y = coords[1].replace(" ", "").replace(".", ",") if len(coords) > 1 else ""
+
+    def fix(c):
+        return c.replace(" ", "").replace(".", ",")
+
+    x = fix(coords[0]) if len(coords) >= 1 else ""
+    y = fix(coords[1]) if len(coords) >= 2 else ""
 
     return sondage, x, y
 
 
 def extract_lithology(img):
-    text = ocr(crop(img, LITHO_BOX), 6).lower()
+    text = ocr_text(crop(img, LITHO_BOX), 6).lower()
 
-    if "tuf" in text and "calcaire" in text:
-        litho1 = "Tuf calcaire"
-    elif "tuf" in text and "graveleux" in text:
+    if "tuf" in text and "graveleux" in text:
         litho1 = "Tuf graveleux"
+    elif "tuf" in text:
+        litho1 = "Tuf calcaire"
     else:
         litho1 = ""
 
@@ -105,23 +104,21 @@ def extract_lithology(img):
 
 
 def extract_pl_points(img):
-    pl_zone = crop(img, PL_BOX)
-    bw = color_only(pl_zone, "blue")
+    zone = crop(img, PL_BOX)
+    bw = color_bw(zone, "blue")
 
     df = pytesseract.image_to_data(
         bw,
         lang="eng",
         config="--psm 6 -c tessedit_char_whitelist=0123456789.,",
         output_type=pytesseract.Output.DATAFRAME
-    )
-
-    df = df.dropna(subset=["text"])
-
-    h = pl_zone.size[1]
-    values = []
+    ).dropna(subset=["text"])
 
     page_w, page_h = img.size
-    pl_y0_global = int(page_h * PL_BOX[1])
+    zone_y0 = int(page_h * PL_BOX[1])
+    h = zone.size[1]
+
+    points = []
 
     for _, r in df.iterrows():
         txt = str(r["text"]).strip()
@@ -134,42 +131,40 @@ def extract_pl_points(img):
 
             if 0.1 <= v <= 30:
                 y_local = r["top"] + r["height"] / 2
-                y_global = pl_y0_global + y_local
-                depth = snap_depth((y_local / h) * 15)
+                y_global = zone_y0 + y_local
+                depth = snap_depth((y_local / h) * DEPTH_MAX)
 
-                values.append({
-                    "depth": depth,
-                    "pl": v,
-                    "y_global": y_global
-                })
+                if 0 < depth <= DEPTH_MAX:
+                    points.append({
+                        "depth": depth,
+                        "pl": v,
+                        "y_global": y_global
+                    })
 
-    values = sorted(values, key=lambda a: a["depth"])
+    final = {}
+    for p in sorted(points, key=lambda x: x["depth"]):
+        final[p["depth"]] = p
 
-    clean = {}
-    for v in values:
-        clean[v["depth"]] = v
-
-    return [clean[d] for d in sorted(clean.keys())]
+    return [final[d] for d in sorted(final.keys())]
 
 
 def get_em_for_pl(img, y_global):
     page_w, page_h = img.size
+    zone = crop(img, EM_BOX)
 
-    em_zone = crop(img, EM_BOX)
-    em_y0_global = int(page_h * EM_BOX[1])
+    em_y0 = int(page_h * EM_BOX[1])
+    y_local = int(y_global - em_y0)
 
-    y_local = int(y_global - em_y0_global)
+    w, h = zone.size
 
-    w, h = em_zone.size
-
-    band = em_zone.crop((
+    band = zone.crop((
         0,
-        max(0, y_local - 35),
+        max(0, y_local - 28),
         w,
-        min(h, y_local + 35)
+        min(h, y_local + 28)
     ))
 
-    bw = color_only(band, "red")
+    bw = color_bw(band, "red")
 
     text = pytesseract.image_to_string(
         bw,
@@ -182,13 +177,17 @@ def get_em_for_pl(img, y_global):
     vals = []
     for n in nums:
         v = to_float(n)
-        if v is not None and 10 <= v <= 20000:
+        if v is None:
+            continue
+
+        # Em généralement > 10 MPa
+        if 10 <= v <= 20000:
             vals.append(v)
 
-    if vals:
-        return vals[-1]
+    if not vals:
+        return ""
 
-    return ""
+    return max(vals)
 
 
 def make_excel(df):
@@ -200,6 +199,7 @@ def make_excel(df):
 
         ws.merge_cells("A1:D1")
         ws["A1"] = "Echantillon"
+
         ws.merge_cells("E1:G1")
         ws["E1"] = "Caracteristiques pressiometriques"
 
