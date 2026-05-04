@@ -1,50 +1,34 @@
 import streamlit as st
 import pandas as pd
-import fitz, re, pytesseract
+import fitz, re, cv2, pytesseract, numpy as np
 from PIL import Image
 from io import BytesIO
 
 pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
-st.title("Extraction PDF pressiométrique → Excel")
-
+st.title("Extraction pressiométrique PDF → Excel")
 uploaded = st.file_uploader("Importer PDF", type=["pdf"])
-
-HEADER_BOX = (0.20, 0.08, 0.99, 0.30)
-LITHO_BOX  = (0.15, 0.28, 0.42, 0.90)
-TABLE_BOX  = (0.45, 0.28, 0.99, 0.90)
 
 DEPTHS = [1.5, 3, 4.5, 6, 7.5, 9, 10.5, 12, 13.5, 15]
 
+HEADER_BOX = (0.20, 0.08, 0.99, 0.30)
+LITHO_BOX  = (0.15, 0.28, 0.42, 0.90)
+PL_BOX     = (0.58, 0.28, 0.78, 0.90)
+EM_BOX     = (0.78, 0.28, 0.98, 0.90)
 
 def crop(img, box):
     w, h = img.size
     return img.crop((int(w*box[0]), int(h*box[1]), int(w*box[2]), int(h*box[3])))
 
-
 def fr(x):
-    return str(x).replace(".", ",")
-
-
-def to_float(x):
-    try:
-        return float(str(x).replace(",", "."))
-    except:
-        return None
-
-
-def ocr(img, psm=6):
-    return pytesseract.image_to_string(img, lang="fra+eng", config=f"--psm {psm}")
-
+    return "" if x == "" else str(x).replace(".", ",")
 
 def extract_header(img):
-    text = ocr(crop(img, HEADER_BOX))
+    text = pytesseract.image_to_string(crop(img, HEADER_BOX), lang="fra+eng", config="--psm 11")
 
     m = re.search(r"(SP\s*[_\-]?\s*[A-Za-z]+\s*[_\-]?\s*\d+)", text, re.I)
-    sondage = ""
-    if m:
-        sondage = re.sub(r"\s+", "", m.group(1)).replace("-", "_")
-        sondage = re.sub(r"_+(\d+)$", r"\1", sondage)  # SP_Reta_043 -> SP_Reta043
+    sondage = re.sub(r"\s+", "", m.group(1)).replace("-", "_") if m else ""
+    sondage = sondage.replace("_0", "0")
 
     coords = re.findall(r"\d{3}\s?\d{3}[.,]\d+", text)
     x = coords[0].replace(" ", "").replace(".", ",") if len(coords) > 0 else ""
@@ -52,46 +36,68 @@ def extract_header(img):
 
     return sondage, x, y
 
+def color_to_bw(img, color):
+    arr = np.array(img.convert("RGB"))
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
 
-def lithologies(img):
-    text = ocr(crop(img, LITHO_BOX)).lower()
+    if color == "blue":
+        mask = cv2.inRange(hsv, np.array([90, 30, 30]), np.array([150, 255, 255]))
+    else:
+        m1 = cv2.inRange(hsv, np.array([0, 30, 30]), np.array([15, 255, 255]))
+        m2 = cv2.inRange(hsv, np.array([160, 30, 30]), np.array([180, 255, 255]))
+        mask = m1 + m2
+
+    out = np.ones(mask.shape, dtype=np.uint8) * 255
+    out[mask > 0] = 0
+    out = cv2.dilate(out, np.ones((2, 2), np.uint8), iterations=1)
+    return Image.fromarray(out)
+
+def fix_pl(v):
+    # exemple OCR: 741 au lieu de 7.41
+    if v > 30:
+        return round(v / 100, 3)
+    return v
+
+def extract_column_values(img, box, color, vmin, vmax, is_pl=False):
+    zone = crop(img, box)
+    bw = color_to_bw(zone, color)
+
+    text = pytesseract.image_to_string(
+        bw,
+        lang="eng",
+        config="--psm 6 -c tessedit_char_whitelist=0123456789.,"
+    )
+
+    nums = re.findall(r"\d+[.,]\d+|\d+", text)
+    vals = []
+
+    for n in nums:
+        try:
+            v = float(n.replace(",", "."))
+            if is_pl:
+                v = fix_pl(v)
+            if vmin <= v <= vmax:
+                vals.append(v)
+        except:
+            pass
+
+    return vals[:10]
+
+def extract_litho(img):
+    text = pytesseract.image_to_string(crop(img, LITHO_BOX), lang="fra+eng", config="--psm 6").lower()
 
     first = "Tuf calcaire" if "tuf" in text else ""
+
     if "calcaire" in text:
         second = "Calcaire dure"
-    elif "schiste" in text or "schiteuse" in text:
+    elif "schist" in text or "schiteuse" in text:
         second = "Roche schisteuse dure"
     elif "granit" in text or "graniste" in text:
         second = "Roche granitique grise"
     else:
-        second = ""
+        second = first
 
     return first, second
-
-
-def read_row_values(table_img, depth):
-    w, h = table_img.size
-
-    y = int((depth / 15) * h)
-    band = table_img.crop((0, max(0, y-35), w, min(h, y+35)))
-
-    text = ocr(band, psm=6)
-    nums = re.findall(r"\d+[.,]\d+", text)
-    vals = [to_float(n) for n in nums]
-    vals = [v for v in vals if v is not None]
-
-    # Ligne type : Pf / Pl / Em
-    candidates = []
-    for i in range(len(vals)-2):
-        pf, pl, em = vals[i], vals[i+1], vals[i+2]
-        if 0.1 <= pf <= 20 and 0.1 <= pl <= 30 and 10 <= em <= 20000:
-            candidates.append((pl, em))
-
-    if candidates:
-        return candidates[-1]
-
-    return "", ""
-
 
 def make_excel(df):
     out = BytesIO()
@@ -105,7 +111,6 @@ def make_excel(df):
     out.seek(0)
     return out
 
-
 if uploaded and st.button("Extraire Excel"):
     doc = fitz.open(stream=uploaded.read(), filetype="pdf")
     rows = []
@@ -115,20 +120,20 @@ if uploaded and st.button("Extraire Excel"):
         img = Image.open(BytesIO(pix.tobytes("png")))
 
         sondage, x, y = extract_header(img)
-        litho1, litho2 = lithologies(img)
-        table_img = crop(img, TABLE_BOX)
+        litho1, litho2 = extract_litho(img)
 
-        for i, d in enumerate(DEPTHS):
-            pl, em = read_row_values(table_img, d)
+        pl_vals = extract_column_values(img, PL_BOX, "blue", 0.1, 30, is_pl=True)
+        em_vals = extract_column_values(img, EM_BOX, "red", 10, 20000, is_pl=False)
 
+        for i, depth in enumerate(DEPTHS):
             rows.append({
                 "Nom du sondages": sondage,
                 "x": x if i == 0 else "",
                 "y": y if i == 0 else "",
-                "Profondeur (m)": fr(d),
-                "Lithologie": litho1 if d <= 2.5 else litho2,
-                "Pl* (MPa)": fr(pl) if pl != "" else "",
-                "Em (MPa)": fr(em) if em != "" else ""
+                "Profondeur (m)": fr(depth),
+                "Lithologie": litho1 if depth <= 2.5 else litho2,
+                "Pl* (MPa)": fr(round(pl_vals[i], 3)) if i < len(pl_vals) else "",
+                "Em (MPa)": fr(round(em_vals[i], 1)) if i < len(em_vals) else ""
             })
 
     df = pd.DataFrame(rows)
