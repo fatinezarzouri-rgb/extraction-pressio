@@ -1,22 +1,21 @@
 import streamlit as st
 import pandas as pd
-import fitz, re, cv2, pytesseract, numpy as np
+import fitz
+import pytesseract
+import re
 from PIL import Image
 from io import BytesIO
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 
 pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
-st.set_page_config(page_title="Extraction Pressiométrique", layout="wide")
-st.title("Extraction automatique PDF pressiométrique → Excel")
+st.set_page_config(page_title="Extraction pressiométrique", layout="wide")
+st.title("Extraction PDF pressiométrique → Excel")
 
-uploaded = st.file_uploader("Importer PDF", type=["pdf"])
+uploaded = st.file_uploader("Importer le PDF", type=["pdf"])
 
-DEPTH_MAX = 15.0
-
-HEADER_BOX = (0.25, 0.11, 0.98, 0.26)
-LITHO_BOX  = (0.15, 0.28, 0.42, 0.90)
-PL_BOX     = (0.62, 0.28, 0.78, 0.90)   # bleu
-EM_BOX     = (0.81, 0.28, 0.97, 0.90)   # rouge à droite seulement
+HEADER_BOX = (0.20, 0.08, 0.99, 0.30)
+DATA_BOX = (0.05, 0.25, 0.99, 0.92)
 
 
 def crop(img, box):
@@ -30,28 +29,19 @@ def fr(x):
     return str(x).replace(".", ",")
 
 
+def to_float(x):
+    try:
+        return float(str(x).replace(",", "."))
+    except:
+        return None
+
+
 def snap_depth(d):
     return round(round(d / 1.5) * 1.5, 1)
 
 
-def clean_num(v):
-    return float(str(v).replace(",", "."))
-
-
-def keep_color(img, color):
-    arr = np.array(img.convert("RGB"))
-    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
-
-    if color == "blue":
-        mask = cv2.inRange(hsv, np.array([90, 35, 35]), np.array([145, 255, 255]))
-    else:
-        m1 = cv2.inRange(hsv, np.array([0, 35, 35]), np.array([15, 255, 255]))
-        m2 = cv2.inRange(hsv, np.array([160, 35, 35]), np.array([180, 255, 255]))
-        mask = m1 + m2
-
-    result = np.ones_like(arr) * 255
-    result[mask > 0] = arr[mask > 0]
-    return Image.fromarray(result)
+def clean_coord(x):
+    return x.replace(" ", "").replace(".", ",")
 
 
 def ocr_text(img):
@@ -66,126 +56,109 @@ def extract_header(img):
     if m:
         sondage = re.sub(r"\s+", "", m.group(1)).replace("-", "_")
 
-    coords = re.findall(r"\d{5,6}[.,]\d+", text)
-    x = fr(coords[0]) if len(coords) >= 1 else ""
-    y = fr(coords[1]) if len(coords) >= 2 else ""
+    coords = re.findall(r"\d{3}\s?\d{3}[.,]\d+", text)
+    x = clean_coord(coords[0]) if len(coords) >= 1 else ""
+    y = clean_coord(coords[1]) if len(coords) >= 2 else ""
 
     return sondage, x, y
 
 
-def clean_litho(txt):
-    t = txt.lower()
-    t = t.replace("lerre", "terre").replace("tufcalcaire", "tuf calcaire")
-    t = t.replace("caleaire", "calcaire").replace("calcaïre", "calcaire")
-    t = t.replace("schiteuse", "schisteuse").replace("graniste", "granitique")
+def clean_litho(text):
+    t = text.lower()
 
-    if "terre" in t:
-        return "Terre végétale"
     if "tuf" in t and "calcaire" in t:
-        return "Tuf calcaire"
-    if "tuf" in t and "graveleux" in t:
-        return "Tuf graveleux"
-    if "calcaire" in t:
-        return "Calcaire dure"
-    if "schiste" in t:
-        return "Roche schisteuse dure"
-    if "granit" in t:
-        return "Roche granitique grise"
-    if "argile" in t:
-        return "Argile"
-    if "sable" in t:
-        return "Sable"
-    if "marne" in t:
-        return "Marne"
-    return ""
+        first = "Tuf calcaire"
+    elif "tuf" in t and "graveleux" in t:
+        first = "Tuf graveleux"
+    else:
+        first = ""
+
+    if "calcaire" in t and ("dur" in t or "dure" in t):
+        second = "Calcaire dure"
+    elif "schiste" in t or "schiteuse" in t:
+        second = "Roche schisteuse dure"
+    elif "granit" in t or "graniste" in t:
+        second = "Roche granitique grise"
+    else:
+        second = first
+
+    return first, second
 
 
-def extract_lithologies(img):
-    text = ocr_text(crop(img, LITHO_BOX))
-    lines = [clean_litho(l) for l in text.split("\n")]
-    lines = [l for l in lines if l]
-
-    clean = []
-    for l in lines:
-        if l not in clean:
-            clean.append(l)
-
-    return clean
-
-
-def lithology_for_depth(depth, lithos):
-    if not lithos:
-        return ""
-    if len(lithos) == 1:
-        return lithos[0]
-    if depth <= 2.5:
-        return lithos[0]
-    return lithos[-1]
-
-
-def extract_values(img, box, color, vmin, vmax):
-    zone = crop(img, box)
-    zone = keep_color(zone, color)
+def extract_rows(img):
+    zone = crop(img, DATA_BOX)
 
     df = pytesseract.image_to_data(
         zone,
-        lang="eng",
+        lang="fra+eng",
         config="--psm 6",
         output_type=pytesseract.Output.DATAFRAME
     )
 
     df = df.dropna(subset=["text"])
+
     h = zone.size[1]
-    values = []
+    lines = {}
 
     for _, r in df.iterrows():
+        key = (int(r["block_num"]), int(r["par_num"]), int(r["line_num"]))
         txt = str(r["text"]).strip()
-        txt = txt.replace("O", "0").replace("o", "0").replace("|", "1").replace("l", "1")
+        if not txt:
+            continue
 
-        nums = re.findall(r"\d+[.,]\d+|\d+", txt)
+        cy = r["top"] + r["height"] / 2
 
-        for n in nums:
-            try:
-                val = clean_num(n)
-            except:
-                continue
+        if key not in lines:
+            lines[key] = {"texts": [], "ys": []}
 
-            if vmin <= val <= vmax:
-                cy = r["top"] + r["height"] / 2
-                depth = snap_depth((cy / h) * DEPTH_MAX)
+        lines[key]["texts"].append(txt)
+        lines[key]["ys"].append(cy)
 
-                if 0 < depth <= DEPTH_MAX:
-                    values.append((depth, val))
-
-    values = sorted(values, key=lambda x: x[0])
-
-    final = {}
-    for d, v in values:
-        final[d] = v
-
-    return sorted(final.items())
-
-
-def merge_values(pls, ems):
     rows = []
-    em_dict = dict(ems)
 
-    for d, pl in pls:
-        em = em_dict.get(d, "")
-        rows.append((d, pl, em))
+    for line in lines.values():
+        text = " ".join(line["texts"])
+        nums = re.findall(r"\d+[.,]\d+", text)
 
-    return rows
+        vals = [to_float(n) for n in nums]
+        vals = [v for v in vals if v is not None]
+
+        # On cherche les lignes Pf / Pl / Em
+        candidates = []
+        for i in range(len(vals) - 2):
+            pf, pl, em = vals[i], vals[i+1], vals[i+2]
+            if 0.1 <= pf <= 20 and 0.1 <= pl <= 30 and 10 <= em <= 20000:
+                candidates.append((pf, pl, em))
+
+        if candidates:
+            pf, pl, em = candidates[-1]
+            cy = sum(line["ys"]) / len(line["ys"])
+            depth_raw = (cy / h) * 15
+            depth = snap_depth(depth_raw)
+
+            if 0 < depth <= 15:
+                rows.append({
+                    "depth": depth,
+                    "pl": pl,
+                    "em": em
+                })
+
+    # supprimer doublons profondeur
+    final = {}
+    for r in sorted(rows, key=lambda x: x["depth"]):
+        final[r["depth"]] = r
+
+    return list(final.values()), ocr_text(zone)
 
 
 def make_excel(df):
-    output = BytesIO()
+    out = BytesIO()
 
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        export = df[[
-            "Nom du sondages", "x", "y", "Profondeur (m)",
-            "Lithologie", "Pl* (MPa)", "Em (MPa)"
-        ]]
+    export = df[
+        ["Nom du sondages", "x", "y", "Profondeur (m)", "Lithologie", "Pl* (MPa)", "Em (MPa)"]
+    ]
 
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
         export.to_excel(writer, index=False, startrow=1, sheet_name="Pressiometrique")
         ws = writer.book["Pressiometrique"]
 
@@ -194,14 +167,35 @@ def make_excel(df):
         ws.merge_cells("E1:G1")
         ws["E1"] = "Caracteristiques pressiometriques"
 
-    output.seek(0)
-    return output
+        blue = PatternFill("solid", fgColor="7EC8E3")
+        thin = Side(style="thin", color="000000")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        for row in ws.iter_rows():
+            for cell in row:
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                cell.border = border
+
+        for cell in ws[1]:
+            cell.fill = blue
+            cell.font = Font(bold=True)
+
+        for cell in ws[2]:
+            cell.fill = blue
+            cell.font = Font(bold=True)
+
+        widths = {"A": 18, "B": 15, "C": 15, "D": 15, "E": 35, "F": 14, "G": 14}
+        for c, w in widths.items():
+            ws.column_dimensions[c].width = w
+
+    out.seek(0)
+    return out
 
 
 if uploaded:
     if st.button("Extraire Excel"):
         doc = fitz.open(stream=uploaded.read(), filetype="pdf")
-        rows = []
+        all_rows = []
 
         progress = st.progress(0)
 
@@ -210,28 +204,26 @@ if uploaded:
             img = Image.open(BytesIO(pix.tobytes("png")))
 
             sondage, x, y = extract_header(img)
-            lithos = extract_lithologies(img)
+            data_rows, litho_text = extract_rows(img)
+            litho1, litho2 = clean_litho(litho_text)
 
-            pls = extract_values(img, PL_BOX, "blue", 0.1, 30)
-            ems = extract_values(img, EM_BOX, "red", 10, 20000)
+            for i, r in enumerate(data_rows):
+                depth = r["depth"]
+                litho = litho1 if depth <= 2.5 else litho2
 
-            merged = merge_values(pls, ems)
-
-            for i, (depth, pl, em) in enumerate(merged):
-                rows.append({
+                all_rows.append({
                     "Nom du sondages": sondage,
                     "x": x if i == 0 else "",
                     "y": y if i == 0 else "",
                     "Profondeur (m)": fr(depth),
-                    "Lithologie": lithology_for_depth(depth, lithos),
-                    "Pl* (MPa)": fr(round(pl, 3)),
-                    "Em (MPa)": fr(round(em, 1)) if em != "" else ""
+                    "Lithologie": litho,
+                    "Pl* (MPa)": fr(round(r["pl"], 3)),
+                    "Em (MPa)": fr(round(r["em"], 1))
                 })
 
             progress.progress((page_index + 1) / len(doc))
 
-        df = pd.DataFrame(rows)
-
+        df = pd.DataFrame(all_rows)
         st.dataframe(df, use_container_width=True)
 
         excel = make_excel(df)
