@@ -1,3 +1,6 @@
-tesseract-ocr
-tesseract-ocr-fra
-tesseract-ocr-eng
+streamlit
+pandas
+pymupdf
+pillow
+pytesseract
+openpyxl
