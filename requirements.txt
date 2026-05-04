@@ -1,6 +1,5 @@
 streamlit
 pandas
 pymupdf
-pillow
 openai
 openpyxl
