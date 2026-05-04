@@ -3,6 +3,8 @@ import pandas as pd
 import fitz
 import pytesseract
 import re
+import cv2
+import numpy as np
 from PIL import Image
 from io import BytesIO
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
@@ -10,26 +12,21 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
 st.set_page_config(page_title="Extraction pressiométrique", layout="wide")
-st.title("Extraction automatique PDF pressiométrique vers Excel")
+st.title("Extraction PDF pressiométrique vers Excel")
 
 uploaded = st.file_uploader("Importer le PDF", type=["pdf"])
 
-# Zones cachées adaptées au format Labotest
 DEPTH_MAX = 15.0
+
 HEADER_BOX = (0.30, 0.12, 0.98, 0.25)
 LITHO_BOX  = (0.12, 0.28, 0.42, 0.90)
-PL_BOX     = (0.60, 0.28, 0.78, 0.90)
-EM_BOX     = (0.76, 0.28, 0.98, 0.90)
+PL_BOX     = (0.55, 0.28, 0.80, 0.90)
+EM_BOX     = (0.75, 0.28, 0.98, 0.90)
 
 
 def crop(img, box):
     w, h = img.size
-    return img.crop((
-        int(w * box[0]),
-        int(h * box[1]),
-        int(w * box[2]),
-        int(h * box[3])
-    ))
+    return img.crop((int(w*box[0]), int(h*box[1]), int(w*box[2]), int(h*box[3])))
 
 
 def fr(x):
@@ -43,6 +40,33 @@ def to_float(x):
         return float(str(x).replace(",", "."))
     except:
         return None
+
+
+def keep_color_only(img, color):
+    arr = np.array(img.convert("RGB"))
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+
+    if color == "blue":
+        lower = np.array([90, 40, 40])
+        upper = np.array([140, 255, 255])
+        mask = cv2.inRange(hsv, lower, upper)
+
+    elif color == "red":
+        lower1 = np.array([0, 40, 40])
+        upper1 = np.array([15, 255, 255])
+        lower2 = np.array([160, 40, 40])
+        upper2 = np.array([180, 255, 255])
+        mask1 = cv2.inRange(hsv, lower1, upper1)
+        mask2 = cv2.inRange(hsv, lower2, upper2)
+        mask = mask1 + mask2
+
+    else:
+        mask = np.zeros(arr.shape[:2], dtype=np.uint8)
+
+    result = np.ones_like(arr) * 255
+    result[mask > 0] = arr[mask > 0]
+
+    return Image.fromarray(result)
 
 
 def ocr_text(img):
@@ -81,11 +105,12 @@ def extract_header(img):
     return sondage, x, y
 
 
-def extract_values(zone_img, vmin, vmax):
-    df = ocr_data(zone_img)
+def extract_values_by_color(zone_img, color, vmin, vmax):
+    color_img = keep_color_only(zone_img, color)
+    df = ocr_data(color_img)
     df = df.dropna(subset=["text"])
 
-    h = zone_img.size[1]
+    h = color_img.size[1]
     values = []
 
     for _, r in df.iterrows():
@@ -124,7 +149,6 @@ def extract_lithologies(zone_img):
 
     lithos = []
 
-    # dictionnaire simple mais propre
     known = [
         "terre végétale",
         "tuf calcaire",
@@ -135,6 +159,8 @@ def extract_lithologies(zone_img):
         "roche schiteuse dure",
         "roche granitique grise",
         "roche graniste grise",
+        "argile à matrice rocheuse",
+        "sable à matrice rocheuse",
         "argile",
         "limon",
         "sable",
@@ -150,11 +176,8 @@ def extract_lithologies(zone_img):
     if not lithos:
         lithos = [""]
 
-    # Si deux lithologies : première couche superficielle, deuxième couche principale
     if len(lithos) == 1:
-        return [
-            {"z1": 0, "z2": DEPTH_MAX, "lithologie": lithos[0]}
-        ]
+        return [{"z1": 0, "z2": DEPTH_MAX, "lithologie": lithos[0]}]
 
     if len(lithos) == 2:
         return [
@@ -222,8 +245,8 @@ def process_page(img, page_num):
 
     lithos = extract_lithologies(litho_zone)
 
-    pl_values = extract_values(pl_zone, 0.1, 20)
-    em_values = extract_values(em_zone, 1, 10000)
+    pl_values = extract_values_by_color(pl_zone, "blue", 0.1, 20)
+    em_values = extract_values_by_color(em_zone, "red", 1, 10000)
 
     merged = merge_pl_em(pl_values, em_values)
 
