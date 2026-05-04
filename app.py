@@ -2,36 +2,35 @@ import streamlit as st
 import pandas as pd
 import fitz
 import pytesseract
-import cv2
-import numpy as np
 import re
-from PIL import Image
+from PIL import Image, ImageDraw
 from io import BytesIO
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 
 pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
-st.set_page_config(page_title="Extraction pressiométrique", layout="wide")
-st.title("Extraction automatique des coupes pressiométriques vers Excel")
+st.set_page_config(page_title="Extraction coupes pressiométriques", layout="wide")
+st.title("Extraction PDF pressiométrique avec calibration")
 
-uploaded = st.file_uploader("Importer le PDF", type=["pdf"])
+uploaded = st.file_uploader("Importer PDF", type=["pdf"])
 
-# Profondeurs standards des essais pressiométriques
-PROF_STD = [1.5, 3, 4.5, 6, 7.5, 9, 10.5, 12, 13.5, 15]
+def crop(img, box):
+    w, h = img.size
+    x1, y1, x2, y2 = box
+    return img.crop((int(w*x1), int(h*y1), int(w*x2), int(h*y2)))
 
+def draw_box(img, box, label):
+    im = img.copy()
+    d = ImageDraw.Draw(im)
+    w, h = im.size
+    x1, y1, x2, y2 = box
+    pts = (int(w*x1), int(h*y1), int(w*x2), int(h*y2))
+    d.rectangle(pts, outline="red", width=5)
+    d.text((pts[0], pts[1]-25), label, fill="red")
+    return im
 
-def fr_num(x):
-    if x is None or x == "":
-        return ""
-    return str(x).replace(".", ",")
-
-
-def to_float(x):
-    try:
-        return float(str(x).replace(",", "."))
-    except:
-        return None
-
+def ocr_text(img, psm=6):
+    return pytesseract.image_to_string(img, lang="fra+eng", config=f"--psm {psm}")
 
 def ocr_data(img, psm=6):
     return pytesseract.image_to_data(
@@ -41,225 +40,134 @@ def ocr_data(img, psm=6):
         output_type=pytesseract.Output.DATAFRAME
     )
 
+def to_float(x):
+    try:
+        return float(str(x).replace(",", "."))
+    except:
+        return None
 
-def crop(img, box):
-    w, h = img.size
-    x1, y1, x2, y2 = box
-    return img.crop((int(w*x1), int(h*y1), int(w*x2), int(h*y2)))
+def fr(x):
+    if x is None or x == "":
+        return ""
+    return str(x).replace(".", ",")
 
-
-def extract_header(img):
-    header = crop(img, (0.33, 0.13, 0.97, 0.25))
-    text = pytesseract.image_to_string(header, lang="fra+eng", config="--psm 6")
+def extract_header(img, header_box):
+    z = crop(img, header_box)
+    t = ocr_text(z, 6)
 
     sondage = ""
     x = ""
     y = ""
 
-    m = re.search(r"Sondage\s*[:\-]?\s*([A-Z]{1,4}[_\-]?[A-Za-z0-9]+)", text, re.I)
+    m = re.search(r"Sondage\s*[:\-]?\s*([A-Z]{1,5}[_\-]?[A-Za-z0-9]+)", t, re.I)
     if m:
-        sondage = m.group(1).strip()
+        sondage = m.group(1).replace("-", "_").strip()
 
-    mx = re.search(r"X\s*[:\-]?\s*([\d\s.,]+)", text)
-    my = re.search(r"Y\s*[:\-]?\s*([\d\s.,]+)", text)
+    mx = re.search(r"X\s*[:\-]?\s*(\d+[.,]\d+)", t)
+    my = re.search(r"Y\s*[:\-]?\s*(\d+[.,]\d+)", t)
 
     if mx:
-        x = mx.group(1).strip().replace(" ", "")
+        x = fr(mx.group(1))
     if my:
-        y = my.group(1).strip().replace(" ", "")
+        y = fr(my.group(1))
 
-    return sondage, x, y
+    return sondage, x, y, t
 
-
-def detect_layer_lines(litho_img):
-    arr = np.array(litho_img.convert("RGB"))
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-
-    edges = cv2.Canny(gray, 50, 150)
-    lines = cv2.HoughLinesP(
-        edges,
-        1,
-        np.pi / 180,
-        threshold=80,
-        minLineLength=int(arr.shape[1] * 0.45),
-        maxLineGap=8
-    )
-
-    ys = [0, arr.shape[0]]
-
-    if lines is not None:
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            if abs(y1 - y2) <= 3:
-                ys.append(int((y1 + y2) / 2))
-
-    ys = sorted(list(set(ys)))
-
-    clean = []
-    for y in ys:
-        if not clean or abs(y - clean[-1]) > 15:
-            clean.append(y)
-
-    return clean
-
-
-def extract_lithology_texts(litho_img):
-    df = ocr_data(litho_img, psm=6)
+def extract_numbers_with_depth(zone, depth_max, vmin, vmax):
+    df = ocr_data(zone, 6)
     df = df.dropna(subset=["text"])
-    df = df[df["text"].astype(str).str.strip() != ""]
-
-    words = []
-    for _, r in df.iterrows():
-        txt = str(r["text"]).strip()
-        if re.search(r"[A-Za-zéèêàùçîôû]", txt):
-            cy = r["top"] + r["height"] / 2
-            words.append((cy, txt))
-
-    words = sorted(words, key=lambda x: x[0])
-
-    groups = []
-    for cy, txt in words:
-        if not groups or abs(cy - groups[-1]["cy"]) > 25:
-            groups.append({"cy": cy, "words": [txt]})
-        else:
-            groups[-1]["words"].append(txt)
-            groups[-1]["cy"] = (groups[-1]["cy"] + cy) / 2
-
-    lithos = []
-    ignore = ["Lithologie", "Profondeur", "LABOTEST"]
-    for g in groups:
-        t = " ".join(g["words"])
-        if not any(i.lower() in t.lower() for i in ignore):
-            lithos.append({"cy": g["cy"], "text": t})
-
-    return lithos
-
-
-def build_layers(litho_img, max_depth=15):
-    lines = detect_layer_lines(litho_img)
-    texts = extract_lithology_texts(litho_img)
-
-    h = litho_img.size[1]
-    layers = []
-
-    for i in range(len(lines) - 1):
-        y1 = lines[i]
-        y2 = lines[i + 1]
-        mid = (y1 + y2) / 2
-
-        z1 = round((y1 / h) * max_depth, 2)
-        z2 = round((y2 / h) * max_depth, 2)
-
-        litho = ""
-        if texts:
-            nearest = min(texts, key=lambda t: abs(t["cy"] - mid))
-            litho = nearest["text"]
-
-        if z2 > z1:
-            layers.append({
-                "z_debut": z1,
-                "z_fin": z2,
-                "lithologie": litho
-            })
-
-    return layers
-
-
-def get_lithology(depth, layers):
-    d = to_float(depth)
-    if d is None:
-        return ""
-
-    for c in layers:
-        if c["z_debut"] <= d <= c["z_fin"]:
-            return c["lithologie"]
-
-    return ""
-
-
-def extract_zone_numbers(zone_img):
-    df = ocr_data(zone_img, psm=6)
-    df = df.dropna(subset=["text"])
-
+    h = zone.size[1]
     values = []
 
     for _, r in df.iterrows():
         txt = str(r["text"]).strip()
-        txt = txt.replace("O", "0").replace("o", "0")
-        txt = txt.replace("l", "1")
+        txt = txt.replace("O", "0").replace("o", "0").replace("|", "1").replace("l", "1")
+        m = re.search(r"\d+[.,]\d+", txt)
+        if not m:
+            continue
 
-        m = re.search(r"\d+[.,]\d+|\d+", txt)
-        if m:
-            val = m.group(0)
-            f = to_float(val)
-            if f is not None:
-                cy = r["top"] + r["height"] / 2
-                values.append({"y": cy, "value": f})
+        val = to_float(m.group(0))
+        if val is None:
+            continue
 
-    values = sorted(values, key=lambda x: x["y"])
+        if vmin <= val <= vmax:
+            cy = r["top"] + r["height"] / 2
+            depth = round((cy / h) * depth_max, 2)
+            values.append({"depth": depth, "value": val})
+
+    values = sorted(values, key=lambda x: x["depth"])
 
     clean = []
     for v in values:
-        if not clean or abs(v["y"] - clean[-1]["y"]) > 18:
+        if not clean or abs(v["depth"] - clean[-1]["depth"]) > 0.25:
             clean.append(v)
 
     return clean
 
+def extract_lithology_points(zone, depth_max):
+    df = ocr_data(zone, 6)
+    df = df.dropna(subset=["text"])
+    h = zone.size[1]
 
-def match_by_order(values, limit=10):
-    values = values[:limit]
-    return values
+    words = []
+    for _, r in df.iterrows():
+        txt = str(r["text"]).strip()
+        if not re.search(r"[A-Za-zéèêàâîïôùûç]", txt):
+            continue
+        if txt.lower() in ["lithologie", "profondeur", "labotest", "m"]:
+            continue
+        cy = r["top"] + r["height"] / 2
+        depth = round((cy / h) * depth_max, 2)
+        words.append((depth, txt))
 
+    words = sorted(words, key=lambda x: x[0])
 
-def process_page(img, page_num):
-    sondage, x, y = extract_header(img)
+    groups = []
+    for depth, word in words:
+        if not groups or abs(depth - groups[-1]["depth"]) > 0.9:
+            groups.append({"depth": depth, "words": [word]})
+        else:
+            groups[-1]["words"].append(word)
+            groups[-1]["depth"] = round((groups[-1]["depth"] + depth) / 2, 2)
 
-    litho_img = crop(img, (0.13, 0.28, 0.39, 0.90))
-    pl_img = crop(img, (0.63, 0.28, 0.78, 0.90))
-    em_img = crop(img, (0.78, 0.28, 0.96, 0.90))
+    return [{"depth": g["depth"], "lithologie": " ".join(g["words"])} for g in groups]
 
-    layers = build_layers(litho_img, max_depth=15)
+def lithology_for_depth(depth, litho_points):
+    if not litho_points:
+        return ""
 
-    pl_vals = match_by_order(extract_zone_numbers(pl_img), 10)
-    em_vals = match_by_order(extract_zone_numbers(em_img), 10)
+    litho_points = sorted(litho_points, key=lambda x: x["depth"])
+    nearest = min(litho_points, key=lambda x: abs(x["depth"] - depth))
+    return nearest["lithologie"]
 
+def merge_pl_em(pls, ems):
     rows = []
-    n = min(len(PROF_STD), max(len(pl_vals), len(em_vals)))
+    used = set()
 
-    for i in range(n):
-        prof = PROF_STD[i]
+    for pl in pls:
+        em_val = ""
+        if ems:
+            candidates = [(i, e) for i, e in enumerate(ems) if i not in used]
+            if candidates:
+                i_best, best = min(candidates, key=lambda x: abs(x[1]["depth"] - pl["depth"]))
+                if abs(best["depth"] - pl["depth"]) <= 0.8:
+                    em_val = best["value"]
+                    used.add(i_best)
 
         rows.append({
-            "Page PDF": page_num,
-            "Nom du sondages": sondage,
-            "x": x if i == 0 else "",
-            "y": y if i == 0 else "",
-            "Profondeur (m)": fr_num(prof),
-            "Lithologie": get_lithology(prof, layers),
-            "Pl* (MPa)": fr_num(round(pl_vals[i]["value"], 3)) if i < len(pl_vals) else "",
-            "Em (MPa)": fr_num(round(em_vals[i]["value"], 1)) if i < len(em_vals) else ""
+            "depth": pl["depth"],
+            "pl": pl["value"],
+            "em": em_val
         })
 
-    return rows, layers
-
+    return rows
 
 def make_excel(df):
-    output = BytesIO()
+    out = BytesIO()
+    export = df[["Nom du sondages", "x", "y", "Profondeur (m)", "Lithologie", "Pl* (MPa)", "Em (MPa)"]]
 
-    export_df = df[
-        [
-            "Nom du sondages",
-            "x",
-            "y",
-            "Profondeur (m)",
-            "Lithologie",
-            "Pl* (MPa)",
-            "Em (MPa)"
-        ]
-    ]
-
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        export_df.to_excel(writer, index=False, startrow=1, sheet_name="Pressiometrique")
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        export.to_excel(writer, index=False, startrow=1, sheet_name="Pressiometrique")
         ws = writer.book["Pressiometrique"]
 
         ws.merge_cells("A1:D1")
@@ -284,49 +192,107 @@ def make_excel(df):
             cell.fill = blue
             cell.font = Font(bold=True)
 
-        widths = {
-            "A": 18, "B": 15, "C": 15, "D": 15,
-            "E": 35, "F": 14, "G": 14
-        }
-
-        for col, width in widths.items():
+        for col, width in {"A":18,"B":15,"C":15,"D":15,"E":35,"F":14,"G":14}.items():
             ws.column_dimensions[col].width = width
 
-    output.seek(0)
-    return output
-
+    out.seek(0)
+    return out
 
 if uploaded:
-    with st.spinner("Analyse du PDF en cours..."):
-        doc = fitz.open(stream=uploaded.read(), filetype="pdf")
+    doc = fitz.open(stream=uploaded.read(), filetype="pdf")
 
+    page_preview = st.number_input("Page test", min_value=1, max_value=len(doc), value=1)
+    depth_max = st.number_input("Profondeur max de la coupe", value=15.0, step=0.5)
+
+    page = doc[page_preview - 1]
+    pix = page.get_pixmap(matrix=fitz.Matrix(3, 3))
+    img = Image.open(BytesIO(pix.tobytes("png")))
+
+    st.subheader("Calibration des zones")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.write("Zone entête")
+        hx1 = st.slider("header x1", 0.0, 1.0, 0.30, 0.01)
+        hy1 = st.slider("header y1", 0.0, 1.0, 0.12, 0.01)
+        hx2 = st.slider("header x2", 0.0, 1.0, 0.98, 0.01)
+        hy2 = st.slider("header y2", 0.0, 1.0, 0.25, 0.01)
+
+        st.write("Zone lithologie")
+        lx1 = st.slider("litho x1", 0.0, 1.0, 0.13, 0.01)
+        ly1 = st.slider("litho y1", 0.0, 1.0, 0.28, 0.01)
+        lx2 = st.slider("litho x2", 0.0, 1.0, 0.39, 0.01)
+        ly2 = st.slider("litho y2", 0.0, 1.0, 0.90, 0.01)
+
+    with col2:
+        st.write("Zone Pl")
+        px1 = st.slider("Pl x1", 0.0, 1.0, 0.63, 0.01)
+        py1 = st.slider("Pl y1", 0.0, 1.0, 0.28, 0.01)
+        px2 = st.slider("Pl x2", 0.0, 1.0, 0.78, 0.01)
+        py2 = st.slider("Pl y2", 0.0, 1.0, 0.90, 0.01)
+
+        st.write("Zone Em")
+        ex1 = st.slider("Em x1", 0.0, 1.0, 0.78, 0.01)
+        ey1 = st.slider("Em y1", 0.0, 1.0, 0.28, 0.01)
+        ex2 = st.slider("Em x2", 0.0, 1.0, 0.97, 0.01)
+        ey2 = st.slider("Em y2", 0.0, 1.0, 0.90, 0.01)
+
+    header_box = (hx1, hy1, hx2, hy2)
+    litho_box = (lx1, ly1, lx2, ly2)
+    pl_box = (px1, py1, px2, py2)
+    em_box = (ex1, ey1, ex2, ey2)
+
+    preview = img.copy()
+    for box, lab in [(header_box, "HEADER"), (litho_box, "LITHO"), (pl_box, "PL"), (em_box, "EM")]:
+        preview = draw_box(preview, box, lab)
+
+    st.image(preview, caption="Ajuste les zones avec les sliders", use_container_width=True)
+
+    if st.button("Extraire tout le PDF"):
         all_rows = []
-        debug_layers = []
+        progress = st.progress(0)
 
-        for page_num, page in enumerate(doc, start=1):
+        for idx, page in enumerate(doc):
             pix = page.get_pixmap(matrix=fitz.Matrix(3, 3))
             img = Image.open(BytesIO(pix.tobytes("png")))
 
-            rows, layers = process_page(img, page_num)
-            all_rows.extend(rows)
+            sondage, x, y, header_text = extract_header(img, header_box)
 
-            for l in layers:
-                l["Page PDF"] = page_num
-                debug_layers.append(l)
+            litho_zone = crop(img, litho_box)
+            pl_zone = crop(img, pl_box)
+            em_zone = crop(img, em_box)
+
+            lithos = extract_lithology_points(litho_zone, depth_max)
+            pls = extract_numbers_with_depth(pl_zone, depth_max, 0.1, 20)
+            ems = extract_numbers_with_depth(em_zone, depth_max, 1, 10000)
+
+            merged = merge_pl_em(pls, ems)
+
+            for i, r in enumerate(merged):
+                d = r["depth"]
+                all_rows.append({
+                    "Page PDF": idx + 1,
+                    "Nom du sondages": sondage,
+                    "x": x if i == 0 else "",
+                    "y": y if i == 0 else "",
+                    "Profondeur (m)": fr(round(d, 2)),
+                    "Lithologie": lithology_for_depth(d, lithos),
+                    "Pl* (MPa)": fr(round(r["pl"], 3)),
+                    "Em (MPa)": fr(round(r["em"], 1)) if r["em"] != "" else ""
+                })
+
+            progress.progress((idx + 1) / len(doc))
 
         df = pd.DataFrame(all_rows)
 
-    st.subheader("Résultat extrait")
-    st.dataframe(df, use_container_width=True)
+        st.subheader("Résultat extrait — tu peux corriger avant Excel")
+        edited = st.data_editor(df, use_container_width=True, num_rows="dynamic")
 
-    with st.expander("Voir les couches détectées"):
-        st.dataframe(pd.DataFrame(debug_layers), use_container_width=True)
-
-    excel = make_excel(df)
-
-    st.download_button(
-        "Télécharger Excel",
-        excel,
-        file_name="extraction_pressiometrique.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+        excel = make_excel(edited)
+        st.download_button(
+            "Télécharger Excel",
+            excel,
+            "extraction_pressiometrique.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
