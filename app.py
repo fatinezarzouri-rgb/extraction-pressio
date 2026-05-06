@@ -127,7 +127,7 @@ def detect_sondage_name_labotest(arr: np.ndarray) -> str:
     h, w = arr.shape[:2]
 
     crop_boxes = [
-        (0.29, 0.64, 0.145, 0.235),  # bon crop principal
+        (0.29, 0.64, 0.145, 0.235),
         (0.28, 0.63, 0.140, 0.230),
         (0.30, 0.65, 0.145, 0.240),
         (0.27, 0.62, 0.140, 0.225),
