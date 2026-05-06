@@ -7,14 +7,11 @@ import numpy as np
 import pandas as pd
 import pytesseract
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageFilter
 
 st.set_page_config(page_title="Extraction Labotest", layout="wide")
 
 
-# -------------------------------------------------
-# OUTILS TEXTE
-# -------------------------------------------------
 def clean_text(s: str) -> str:
     rep = {
         "é": "e", "è": "e", "ê": "e", "ë": "e",
@@ -78,7 +75,6 @@ def normalize_label(label: str) -> str:
 def merge_split_lines(lines):
     merged = []
     i = 0
-
     while i < len(lines):
         cur = normalize_spaces(lines[i])
         nxt = normalize_spaces(lines[i + 1]) if i + 1 < len(lines) else ""
@@ -105,7 +101,6 @@ def merge_split_lines(lines):
 
         merged.append(combo)
         i += 1
-
     return merged
 
 
@@ -119,9 +114,6 @@ def parse_labels(lines):
     return out
 
 
-# -------------------------------------------------
-# IMAGE
-# -------------------------------------------------
 def render_page_to_array(doc, page_index: int, zoom: float = 2.0):
     page = doc[page_index]
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
@@ -129,40 +121,62 @@ def render_page_to_array(doc, page_index: int, zoom: float = 2.0):
     return arr
 
 
-# -------------------------------------------------
-# NOM EXACT DU SONDAGE - LABOTEST SEULEMENT
-# -------------------------------------------------
-def extract_labotest_name_from_header(arr: np.ndarray):
+def preprocess_for_ocr(img: Image.Image):
+    variants = []
+
+    gray = img.convert("L")
+    variants.append(gray)
+
+    bw1 = gray.point(lambda p: 255 if p > 180 else 0)
+    bw2 = gray.point(lambda p: 255 if p > 150 else 0)
+
+    variants.append(bw1)
+    variants.append(bw2)
+
+    variants.append(gray.filter(ImageFilter.SHARPEN))
+    variants.append(gray.resize((gray.width * 3, gray.height * 3)))
+    variants.append(bw1.resize((bw1.width * 3, bw1.height * 3)))
+    variants.append(bw2.resize((bw2.width * 3, bw2.height * 3)))
+    variants.append(gray.filter(ImageFilter.SHARPEN).resize((gray.width * 4, gray.height * 4)))
+
+    return variants
+
+
+def detect_sondage_name_labotest(arr: np.ndarray):
     h, w = arr.shape[:2]
 
-    # zone de la case jaune
+    # zone de la case "Sondage : ..."
     x1 = int(w * 0.33)
     x2 = int(w * 0.56)
     y1 = int(h * 0.08)
     y2 = int(h * 0.16)
 
     crop = arr[y1:y2, x1:x2]
-    crop_img = Image.fromarray(crop).resize((crop.shape[1] * 4, crop.shape[0] * 4))
+    base_img = Image.fromarray(crop)
 
-    txt = pytesseract.image_to_string(crop_img, config="--psm 7")
-    txt = txt.replace("\n", " ").strip()
+    variants = preprocess_for_ocr(base_img)
+    psm_modes = [7, 6, 11]
 
-    # exemple: Sondage : SP_Rem_001
-    m = re.search(r"Sondage\s*:\s*([A-Za-z0-9_\-\/]+)", txt, flags=re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
+    patterns = [
+        r"Sondage\s*:\s*([A-Za-z0-9_\-/]+)",
+        r"Sondage\s+([A-Za-z0-9_\-/]+)",
+        r"(SP[_\-]?[A-Za-z0-9_\-]+)",
+        r"([A-Za-z]{1,15}[_\-]?[A-Za-z0-9_\-]+)",
+    ]
 
-    # secours: si l'OCR lit juste le nom
-    m = re.search(r"(SP[_\-]?[A-Za-z0-9_\-]+)", txt, flags=re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
+    for img in variants:
+        for psm in psm_modes:
+            txt = pytesseract.image_to_string(img, config=f"--psm {psm}")
+            txt = txt.replace("\n", " ").strip()
 
-    return None
+            for pat in patterns:
+                m = re.search(pat, txt, flags=re.IGNORECASE)
+                if m:
+                    return m.group(1).strip(), txt
+
+    return "", ""
 
 
-# -------------------------------------------------
-# LABOTEST : LITHOLOGIE
-# -------------------------------------------------
 def labotest_lithology_zone(arr: np.ndarray):
     return arr[430:1450, 240:470]
 
@@ -173,7 +187,7 @@ def extract_labels_labotest(arr: np.ndarray):
     txt = pytesseract.image_to_string(text_crop, config="--psm 6")
     raw_lines = [ln.strip() for ln in txt.splitlines() if re.search(r"[A-Za-zÀ-ÿ]", ln)]
     labels = parse_labels(raw_lines)
-    return labels, txt
+    return labels
 
 
 def extract_depths_labotest(arr: np.ndarray, labels: list[str]):
@@ -233,9 +247,6 @@ def extract_depths_labotest(arr: np.ndarray, labels: list[str]):
     return starts, ends
 
 
-# -------------------------------------------------
-# POST-TRAITEMENT
-# -------------------------------------------------
 def fix_final_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     data = df.to_dict("records")
@@ -302,13 +313,6 @@ def fix_final_dataframe(df: pd.DataFrame) -> pd.DataFrame:
                     i += 2
                     continue
 
-                if lith_n == "sable" and "argileux" in nxt_lith_n:
-                    row["Lithologie"] = "Sable argileux"
-                    row["Profondeur_fin (m)"] = nxt["Profondeur_fin (m)"]
-                    rows.append(row)
-                    i += 2
-                    continue
-
         if lith_n in ["graveleux", "graveleuse", "matrice roche", "matrice rocheuse", "conglomeratic", "conglomeratique"]:
             i += 1
             continue
@@ -318,8 +322,7 @@ def fix_final_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     out = pd.DataFrame(rows)
     out = out[out["Lithologie"].astype(str).str.strip() != ""]
-    out = out.reset_index(drop=True)
-    return out
+    return out.reset_index(drop=True)
 
 
 def normalize_depth_value(v):
@@ -334,24 +337,23 @@ def normalize_depth_value(v):
         return v
 
 
-# -------------------------------------------------
-# EXTRACTION GLOBALE LABOTEST
-# -------------------------------------------------
-def extract_dataframe(pdf_bytes: bytes) -> pd.DataFrame:
+def extract_dataframe(pdf_bytes: bytes):
     tmp_pdf = Path("tmp_upload.pdf")
     tmp_pdf.write_bytes(pdf_bytes)
 
     doc = fitz.open(str(tmp_pdf))
     rows = []
+    undetected_pages = []
 
     for i in range(len(doc)):
         arr = render_page_to_array(doc, i, zoom=2)
 
-        sondage = extract_labotest_name_from_header(arr)
+        sondage, ocr_name_debug = detect_sondage_name_labotest(arr)
         if not sondage:
-            sondage = f"Sondage_{i + 1:03d}"
+            undetected_pages.append(i + 1)
+            continue
 
-        labels, _ = extract_labels_labotest(arr)
+        labels = extract_labels_labotest(arr)
         if not labels:
             continue
 
@@ -366,31 +368,22 @@ def extract_dataframe(pdf_bytes: bytes) -> pd.DataFrame:
             })
 
     df = pd.DataFrame(rows)
+    if not df.empty:
+        df = fix_final_dataframe(df)
 
-    if df.empty:
-        return df
-
-    df = fix_final_dataframe(df)
-    return df
+    return df, undetected_pages
 
 
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Lithologie")
-        resume = df.groupby("Sondage", as_index=False).agg(
-            Nb_couches=("Lithologie", "size")
-        )
-        resume.to_excel(writer, index=False, sheet_name="Resume")
     output.seek(0)
     return output.getvalue()
 
 
-# -------------------------------------------------
-# STREAMLIT
-# -------------------------------------------------
 st.title("Extraction lithologie Labotest")
-st.write("Importer uniquement un PDF Labotest. Le nom du sondage est lu dans la case 'Sondage :'.")
+st.write("Version détection seulement du nom du sondage dans la case 'Sondage :'.")
 
 pdf_file = st.file_uploader("PDF Labotest", type=["pdf"])
 
@@ -400,25 +393,21 @@ if st.button("Lancer l'extraction", type="primary"):
     else:
         try:
             with st.spinner("Extraction en cours..."):
-                df = extract_dataframe(pdf_file.read())
+                df, undetected_pages = extract_dataframe(pdf_file.read())
+
+            if undetected_pages:
+                st.warning(f"Nom du sondage non détecté sur les pages : {undetected_pages}")
 
             if df.empty:
                 st.warning("Aucune donnée détectée.")
             else:
-                show_cols = [
-                    "Sondage",
-                    "Lithologie",
-                    "Profondeur_debut (m)",
-                    "Profondeur_fin (m)",
-                ]
+                cols = ["Sondage", "Lithologie", "Profondeur_debut (m)", "Profondeur_fin (m)"]
                 st.success(f"Extraction terminée : {len(df)} lignes")
-                st.dataframe(df[show_cols], use_container_width=True)
-
-                excel_bytes = to_excel_bytes(df[show_cols])
+                st.dataframe(df[cols], use_container_width=True)
 
                 st.download_button(
                     "Télécharger l'Excel",
-                    data=excel_bytes,
+                    data=to_excel_bytes(df[cols]),
                     file_name="lithologie_labotest.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
