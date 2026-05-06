@@ -1,4 +1,3 @@
-
 import re
 from io import BytesIO
 from pathlib import Path
@@ -14,7 +13,7 @@ st.set_page_config(page_title="Extraction lithologie PDF", layout="wide")
 
 
 # =========================================================
-# TEXTE
+# OUTILS TEXTE
 # =========================================================
 def clean_text(s: str) -> str:
     rep = {
@@ -145,7 +144,7 @@ def parse_labels(lines):
 # =========================================================
 # NOM EXACT DU SONDAGE
 # =========================================================
-def extract_exact_sondage_name(page_text: str, page_number: int) -> str:
+def extract_exact_sondage_name(page_text: str, arr: np.ndarray, page_number: int) -> str:
     txt = page_text.replace("\n", " ")
 
     patterns = [
@@ -163,12 +162,32 @@ def extract_exact_sondage_name(page_text: str, page_number: int) -> str:
             val = m.group(1).strip()
             val = val.replace(" ", "_")
             val = re.sub(r"_+", "_", val)
-
-            # Normalisation SP_Rem / SP_Reta
             val = re.sub(r"(?i)^sp[_\- ]?rem[_\- ]?(\d+)$", lambda x: f"SP_Rem{int(x.group(1)):03d}", val)
             val = re.sub(r"(?i)^sp[_\- ]?reta[_\- ]?(\d+)$", lambda x: f"SP_Reta{int(x.group(1)):03d}", val)
+            return val
 
-            # Garde LPEE tel quel
+    h, w = arr.shape[:2]
+    header_crop = arr[40:int(h * 0.22), int(w * 0.22):int(w * 0.88)]
+    header_img = Image.fromarray(header_crop)
+
+    ocr_txt = pytesseract.image_to_string(header_img, config="--psm 6")
+    ocr_txt = ocr_txt.replace("\n", " ")
+
+    ocr_patterns = [
+        r"(SP[_\-\s]?(?:Rem|Reta)\d+)",
+        r"Sondage\s+pressiom[eé]trique\s+M[eé]nard\s*[:\-]?\s*([A-Za-z0-9_\-\/]+)",
+        r"(T\d+\-SCP\-EXE\-\d+)",
+        r"(T\d+\-[A-Za-z0-9\-]+)",
+    ]
+
+    for pat in ocr_patterns:
+        m = re.search(pat, ocr_txt, flags=re.IGNORECASE)
+        if m:
+            val = m.group(1).strip()
+            val = val.replace(" ", "_")
+            val = re.sub(r"_+", "_", val)
+            val = re.sub(r"(?i)^sp[_\- ]?rem[_\- ]?(\d+)$", lambda x: f"SP_Rem{int(x.group(1)):03d}", val)
+            val = re.sub(r"(?i)^sp[_\- ]?reta[_\- ]?(\d+)$", lambda x: f"SP_Reta{int(x.group(1)):03d}", val)
             return val
 
     return f"Sondage_{page_number:03d}"
@@ -185,7 +204,7 @@ def render_page_to_array(doc, page_index: int, zoom: float = 2.0):
 
 
 # =========================================================
-# DETECTION MODE PDF
+# DETECTION TYPE PDF
 # =========================================================
 def detect_pdf_type(page_text: str) -> str:
     t = clean_text(page_text)
@@ -274,20 +293,8 @@ def extract_depths_labotest(arr: np.ndarray, labels: list[str]):
 # LPEE / CES
 # =========================================================
 def extract_lpee_breaks_from_text(page_text: str):
-    """
-    Pour le type LPEE, le texte parsé contient souvent:
-    1.50
-    12.50
-    15.00
-    22.00
-    Lithologie
-    Tirs
-    Grès lumachellique
-    ...
-    """
     lines = [normalize_spaces(x) for x in page_text.splitlines() if normalize_spaces(x)]
 
-    # profondeurs
     depth_candidates = []
     after_prof = False
     for ln in lines:
@@ -307,13 +314,11 @@ def extract_lpee_breaks_from_text(page_text: str):
         if "lithologie" in ln_n:
             break
 
-    # garde des profondeurs strictement croissantes
     depths = []
     for d in depth_candidates:
         if not depths or d > depths[-1]:
             depths.append(d)
 
-    # lithologies
     labels = []
     start_labels = False
     stop_words = [
@@ -356,13 +361,10 @@ def extract_lpee_data(page_text: str):
     if total_depth is None:
         total_depth = breaks[-1] if breaks else 15.0
 
-    # Ex: labels = 4 couches, breaks = [1.5, 12.5, 15, 22]
-    # => starts [0,1.5,12.5,15], ends [1.5,12.5,15,22]
     if len(breaks) >= len(labels):
         ends = breaks[:len(labels)]
         starts = [0.0] + ends[:-1]
     else:
-        # fallback
         starts = [0.0]
         for _ in range(len(labels) - 1):
             starts.append("")
@@ -370,7 +372,6 @@ def extract_lpee_data(page_text: str):
         if ends:
             ends[-1] = total_depth
 
-    # complète la dernière fin si besoin
     if len(ends) == len(labels) and ends[-1] == "":
         ends[-1] = total_depth
 
@@ -534,7 +535,7 @@ def normalize_depth_value(v):
         if abs(x - round(x)) < 1e-9:
             return int(round(x))
         return round(x, 2)
-    except:
+    except Exception:
         return v
 
 
@@ -551,15 +552,14 @@ def extract_dataframe(pdf_bytes: bytes) -> pd.DataFrame:
     for i in range(len(doc)):
         page = doc[i]
         page_text = page.get_text("text")
-        sondage = extract_exact_sondage_name(page_text, i + 1)
+        arr = render_page_to_array(doc, i, zoom=2)
+
+        sondage = extract_exact_sondage_name(page_text, arr, i + 1)
         pdf_type = detect_pdf_type(page_text)
 
         if pdf_type == "LPEE":
             labels, starts, ends, source = extract_lpee_data(page_text)
-
         else:
-            arr = render_page_to_array(doc, i, zoom=2)
-
             if pdf_type == "LABOTEST":
                 labels, raw_ocr = extract_labels_labotest(arr)
                 if labels:
@@ -605,10 +605,10 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
 
 
 # =========================================================
-# INTERFACE
+# INTERFACE STREAMLIT
 # =========================================================
 st.title("Extraction lithologie depuis PDF")
-st.write("Importe un PDF Labotest ou LPEE/CES. Le nom du sondage sera gardé tel quel.")
+st.write("Importe un PDF Labotest ou LPEE/CES. Le nom exact du sondage sera conservé.")
 
 pdf_file = st.file_uploader("PDF", type=["pdf"])
 
