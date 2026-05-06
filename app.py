@@ -145,37 +145,28 @@ def preprocess_for_ocr(img: Image.Image):
 def detect_sondage_name_labotest(arr: np.ndarray):
     h, w = arr.shape[:2]
 
-    # zone de la case "Sondage : ..."
-    x1 = int(w * 0.33)
-    x2 = int(w * 0.56)
-    y1 = int(h * 0.08)
-    y2 = int(h * 0.16)
+    # crop exact dyal case "Sondage : ..."
+    # had l-values a9rab l screenshot li sifti
+    x1 = int(w * 0.37)
+    x2 = int(w * 0.60)
+    y1 = int(h * 0.105)
+    y2 = int(h * 0.165)
 
     crop = arr[y1:y2, x1:x2]
-    base_img = Image.fromarray(crop)
+    img = Image.fromarray(crop).convert("L")
+    img = img.resize((img.width * 5, img.height * 5))
 
-    variants = preprocess_for_ocr(base_img)
-    psm_modes = [7, 6, 11]
+    # binarisation bach ywli lktaba wdha
+    img = img.point(lambda p: 255 if p > 170 else 0)
 
-    patterns = [
-        r"Sondage\s*:\s*([A-Za-z0-9_\-/]+)",
-        r"Sondage\s+([A-Za-z0-9_\-/]+)",
-        r"(SP[_\-]?[A-Za-z0-9_\-]+)",
-        r"([A-Za-z]{1,15}[_\-]?[A-Za-z0-9_\-]+)",
-    ]
+    txt = pytesseract.image_to_string(img, config="--psm 7")
+    txt = txt.replace("\n", " ").strip()
 
-    for img in variants:
-        for psm in psm_modes:
-            txt = pytesseract.image_to_string(img, config=f"--psm {psm}")
-            txt = txt.replace("\n", " ").strip()
+    m = re.search(r"Sondage\s*:\s*([A-Za-z0-9_\-/]+)", txt, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
 
-            for pat in patterns:
-                m = re.search(pat, txt, flags=re.IGNORECASE)
-                if m:
-                    return m.group(1).strip(), txt
-
-    return "", ""
-
+    return ""
 
 def labotest_lithology_zone(arr: np.ndarray):
     return arr[430:1450, 240:470]
