@@ -9,7 +9,7 @@ import pytesseract
 import streamlit as st
 from PIL import Image, ImageFilter
 
-st.set_page_config(page_title="Extraction lithologie Labotest", layout="wide")
+st.set_page_config(page_title="Extraction lithologie", layout="wide")
 
 
 def clean_text(s: str) -> str:
@@ -126,7 +126,7 @@ def render_page_to_array(doc, page_index: int, zoom: float = 2.0):
 def detect_sondage_name_labotest(arr: np.ndarray) -> str:
     h, w = arr.shape[:2]
 
-    # zone Date / Sondage
+    # Ajuste ici si besoin
     x1 = int(w * 0.31)
     x2 = int(w * 0.53)
     y1 = int(h * 0.09)
@@ -150,14 +150,12 @@ def detect_sondage_name_labotest(arr: np.ndarray) -> str:
             txt = pytesseract.image_to_string(img, config=f"--psm {psm}")
             txt = txt.replace("\n", " ").strip()
 
-            # priorité absolue
             m = re.search(r"Sondage\s*:\s*([A-Za-z0-9_\-/]+)", txt, flags=re.IGNORECASE)
             if m:
                 val = m.group(1).strip()
                 if val and clean_text(val) != "objet":
                     return val
 
-            # secours: seulement SP_Rem / SP_Reta
             m = re.search(r"(SP[_\-]?(?:Rem|Reta)[_\-]?\d+)", txt, flags=re.IGNORECASE)
             if m:
                 val = m.group(1).strip()
@@ -176,8 +174,7 @@ def extract_labels_labotest(arr: np.ndarray):
     text_crop = Image.fromarray(zone[:, 35:190])
     txt = pytesseract.image_to_string(text_crop, config="--psm 6")
     raw_lines = [ln.strip() for ln in txt.splitlines() if re.search(r"[A-Za-zÀ-ÿ]", ln)]
-    labels = parse_labels(raw_lines)
-    return labels
+    return parse_labels(raw_lines)
 
 
 def extract_depths_labotest(arr: np.ndarray, labels: list[str]):
@@ -217,7 +214,7 @@ def extract_depths_labotest(arr: np.ndarray, labels: list[str]):
                 d = 0.5 if c < 45 else round(((c - 28.5) / 61) * 2) / 2
                 if d < 1.0:
                     bounds = [d] + bounds
-        elif bounds[0] < 1.0:
+        elif bounds and bounds[0] < 1.0:
             bounds[0] = 0.5
 
     bounds = sorted(set(round(float(b) * 2) / 2 for b in bounds if 0 < b < 15))
@@ -341,7 +338,7 @@ def extract_dataframe(pdf_bytes: bytes):
         sondage = detect_sondage_name_labotest(arr)
         if not sondage:
             undetected_pages.append(i + 1)
-            continue
+            sondage = f"PAGE_{i+1:03d}"
 
         labels = extract_labels_labotest(arr)
         if not labels:
@@ -372,10 +369,9 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-st.title("Extraction lithologie Labotest")
-st.write("Version Labotest seulement, avec rejet de 'OBJET'.")
+st.title("Extraction lithologie")
 
-pdf_file = st.file_uploader("PDF Labotest", type=["pdf"])
+pdf_file = st.file_uploader("", type=["pdf"])
 
 if st.button("Lancer l'extraction", type="primary"):
     if pdf_file is None:
