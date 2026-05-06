@@ -124,43 +124,44 @@ def render_page_to_array(doc, page_index: int, zoom: float = 2.0):
 
 
 def detect_sondage_name_labotest(arr: np.ndarray) -> str:
+    """
+    Zone recalée sur le vrai bloc:
+    Date / Sondage / Machine / Profondeur
+    """
     h, w = arr.shape[:2]
 
-    # Ajuste ici si besoin
-    x1 = int(w * 0.31)
-    x2 = int(w * 0.53)
-    y1 = int(h * 0.09)
-    y2 = int(h * 0.17)
+    x1 = int(w * 0.29)
+    x2 = int(w * 0.64)
+    y1 = int(h * 0.145)
+    y2 = int(h * 0.235)
 
     crop = arr[y1:y2, x1:x2]
-    base_img = Image.fromarray(crop).convert("L")
+    base = Image.fromarray(crop).convert("L")
 
     variants = [
-        base_img,
-        base_img.resize((base_img.width * 4, base_img.height * 4)),
-        base_img.point(lambda p: 255 if p > 170 else 0).resize((base_img.width * 4, base_img.height * 4)),
-        base_img.point(lambda p: 255 if p > 145 else 0).resize((base_img.width * 4, base_img.height * 4)),
-        base_img.filter(ImageFilter.SHARPEN).resize((base_img.width * 4, base_img.height * 4)),
+        base,
+        base.resize((base.width * 3, base.height * 3)),
+        base.point(lambda p: 255 if p > 175 else 0).resize((base.width * 3, base.height * 3)),
+        base.point(lambda p: 255 if p > 150 else 0).resize((base.width * 3, base.height * 3)),
+        base.filter(ImageFilter.SHARPEN).resize((base.width * 4, base.height * 4)),
     ]
 
-    psm_modes = [6, 7, 11]
+    psm_modes = [6, 11]
 
     for img in variants:
         for psm in psm_modes:
             txt = pytesseract.image_to_string(img, config=f"--psm {psm}")
-            txt = txt.replace("\n", " ").strip()
+            txt = txt.replace("\n", " ")
 
+            # priorité absolue : texte après "Sondage :"
             m = re.search(r"Sondage\s*:\s*([A-Za-z0-9_\-/]+)", txt, flags=re.IGNORECASE)
             if m:
-                val = m.group(1).strip()
-                if val and clean_text(val) != "objet":
-                    return val
+                return m.group(1).strip()
 
+            # secours si la ligne est lue sans le mot complet
             m = re.search(r"(SP[_\-]?(?:Rem|Reta)[_\-]?\d+)", txt, flags=re.IGNORECASE)
             if m:
-                val = m.group(1).strip()
-                if val:
-                    return val
+                return m.group(1).strip()
 
     return ""
 
@@ -338,7 +339,7 @@ def extract_dataframe(pdf_bytes: bytes):
         sondage = detect_sondage_name_labotest(arr)
         if not sondage:
             undetected_pages.append(i + 1)
-            sondage = f"PAGE_{i+1:03d}"
+            sondage = f"NON_DETECTE_PAGE_{i+1:03d}"
 
         labels = extract_labels_labotest(arr)
         if not labels:
