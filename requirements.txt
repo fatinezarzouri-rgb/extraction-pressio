@@ -2,7 +2,4 @@ streamlit
 pandas
 pymupdf
 pillow
-pytesseract
-opencv-python-headless
-numpy
 openpyxl
