@@ -123,57 +123,46 @@ def render_page_to_array(doc, page_index: int, zoom: float = 2.0):
     return arr
 
 
-def preprocess_for_ocr(img: Image.Image):
-    variants = []
-
-    gray = img.convert("L")
-    variants.append(gray)
-
-    bw1 = gray.point(lambda p: 255 if p > 170 else 0)
-    bw2 = gray.point(lambda p: 255 if p > 145 else 0)
-
-    variants.append(bw1)
-    variants.append(bw2)
-    variants.append(gray.filter(ImageFilter.SHARPEN))
-    variants.append(gray.resize((gray.width * 4, gray.height * 4)))
-    variants.append(bw1.resize((bw1.width * 4, bw1.height * 4)))
-    variants.append(bw2.resize((bw2.width * 4, bw2.height * 4)))
-    variants.append(gray.filter(ImageFilter.SHARPEN).resize((gray.width * 5, gray.height * 5)))
-
-    return variants
-
-
 def detect_sondage_name_labotest(arr: np.ndarray) -> str:
     h, w = arr.shape[:2]
 
-    # crop de la case "Sondage : ..."
-    x1 = int(w * 0.37)
-    x2 = int(w * 0.60)
-    y1 = int(h * 0.105)
-    y2 = int(h * 0.165)
+    # zone Date / Sondage
+    x1 = int(w * 0.31)
+    x2 = int(w * 0.53)
+    y1 = int(h * 0.09)
+    y2 = int(h * 0.17)
 
     crop = arr[y1:y2, x1:x2]
-    base_img = Image.fromarray(crop)
+    base_img = Image.fromarray(crop).convert("L")
 
-    variants = preprocess_for_ocr(base_img)
-    psm_modes = [7, 6, 11]
-
-    patterns = [
-        r"Sondage\s*:\s*([A-Za-z0-9_\-/]+)",
-        r"Sondage\s+([A-Za-z0-9_\-/]+)",
-        r"(SP[_\-]?[A-Za-z0-9_\-]+)",
-        r"([A-Za-z]{1,15}[_\-]?[A-Za-z0-9_\-]+)",
+    variants = [
+        base_img,
+        base_img.resize((base_img.width * 4, base_img.height * 4)),
+        base_img.point(lambda p: 255 if p > 170 else 0).resize((base_img.width * 4, base_img.height * 4)),
+        base_img.point(lambda p: 255 if p > 145 else 0).resize((base_img.width * 4, base_img.height * 4)),
+        base_img.filter(ImageFilter.SHARPEN).resize((base_img.width * 4, base_img.height * 4)),
     ]
+
+    psm_modes = [6, 7, 11]
 
     for img in variants:
         for psm in psm_modes:
             txt = pytesseract.image_to_string(img, config=f"--psm {psm}")
             txt = txt.replace("\n", " ").strip()
 
-            for pat in patterns:
-                m = re.search(pat, txt, flags=re.IGNORECASE)
-                if m:
-                    return m.group(1).strip()
+            # priorité absolue
+            m = re.search(r"Sondage\s*:\s*([A-Za-z0-9_\-/]+)", txt, flags=re.IGNORECASE)
+            if m:
+                val = m.group(1).strip()
+                if val and clean_text(val) != "objet":
+                    return val
+
+            # secours: seulement SP_Rem / SP_Reta
+            m = re.search(r"(SP[_\-]?(?:Rem|Reta)[_\-]?\d+)", txt, flags=re.IGNORECASE)
+            if m:
+                val = m.group(1).strip()
+                if val:
+                    return val
 
     return ""
 
@@ -384,7 +373,7 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
 
 
 st.title("Extraction lithologie Labotest")
-st.write("Version Labotest seulement. Détection réelle du nom dans la case 'Sondage :'.")
+st.write("Version Labotest seulement, avec rejet de 'OBJET'.")
 
 pdf_file = st.file_uploader("PDF Labotest", type=["pdf"])
 
