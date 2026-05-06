@@ -124,59 +124,49 @@ def render_page_to_array(doc, page_index: int, zoom: float = 2.0):
 
 
 def detect_sondage_name_labotest(arr: np.ndarray) -> str:
-    """
-    Zone recalée sur le vrai bloc:
-    Date / Sondage / Machine / Profondeur
-    """
     h, w = arr.shape[:2]
 
-    x1 = int(w * 0.29)
-    x2 = int(w * 0.64)
-    y1 = int(h * 0.145)
-    y2 = int(h * 0.235)
-
-    crop = arr[y1:y2, x1:x2]
-    base = Image.fromarray(crop).convert("L")
-
-    variants = [
-        base,
-        base.resize((base.width * 3, base.height * 3)),
-        base.point(lambda p: 255 if p > 175 else 0).resize((base.width * 3, base.height * 3)),
-        base.point(lambda p: 255 if p > 150 else 0).resize((base.width * 3, base.height * 3)),
-        base.filter(ImageFilter.SHARPEN).resize((base.width * 4, base.height * 4)),
+    # plusieurs zones proches de la case "Sondage : ..."
+    crop_boxes = [
+        (0.29, 0.64, 0.145, 0.235),
+        (0.27, 0.62, 0.140, 0.230),
+        (0.31, 0.66, 0.145, 0.240),
+        (0.28, 0.60, 0.135, 0.220),
     ]
 
-    psm_modes = [6, 11]
+    psm_modes = [6, 7, 11]
 
-    for img in variants:
-        for psm in psm_modes:
-            txt = pytesseract.image_to_string(img, config=f"--psm {psm}")
-            txt = txt.replace("\n", " ")
+    for bx1, bx2, by1, by2 in crop_boxes:
+        x1 = int(w * bx1)
+        x2 = int(w * bx2)
+        y1 = int(h * by1)
+        y2 = int(h * by2)
 
-            # priorité absolue : texte après "Sondage :"
-            m = re.search(r"Sondage\s*:\s*([A-Za-z0-9_\-/]+)", txt, flags=re.IGNORECASE)
-            if m:
-                return m.group(1).strip()
+        crop = arr[y1:y2, x1:x2]
+        base = Image.fromarray(crop).convert("L")
 
-            # secours si la ligne est lue sans le mot complet
-            m = re.search(r"(SP[_\-]?(?:Rem|Reta)[_\-]?\d+)", txt, flags=re.IGNORECASE)
-            if m:
-                return m.group(1).strip()
+        variants = [
+            base,
+            base.resize((base.width * 3, base.height * 3)),
+            base.point(lambda p: 255 if p > 175 else 0).resize((base.width * 3, base.height * 3)),
+            base.point(lambda p: 255 if p > 150 else 0).resize((base.width * 3, base.height * 3)),
+            base.filter(ImageFilter.SHARPEN).resize((base.width * 4, base.height * 4)),
+        ]
+
+        for img in variants:
+            for psm in psm_modes:
+                txt = pytesseract.image_to_string(img, config=f"--psm {psm}")
+                txt = txt.replace("\n", " ")
+
+                m = re.search(r"Sondage\s*:\s*([A-Za-z0-9_\-/]+)", txt, flags=re.IGNORECASE)
+                if m:
+                    return m.group(1).strip()
+
+                m = re.search(r"(SP[_\-]?(?:Rem|Reta)[_\-]?\d+)", txt, flags=re.IGNORECASE)
+                if m:
+                    return m.group(1).strip()
 
     return ""
-
-
-def labotest_lithology_zone(arr: np.ndarray):
-    return arr[430:1450, 240:470]
-
-
-def extract_labels_labotest(arr: np.ndarray):
-    zone = labotest_lithology_zone(arr)
-    text_crop = Image.fromarray(zone[:, 35:190])
-    txt = pytesseract.image_to_string(text_crop, config="--psm 6")
-    raw_lines = [ln.strip() for ln in txt.splitlines() if re.search(r"[A-Za-zÀ-ÿ]", ln)]
-    return parse_labels(raw_lines)
-
 
 def extract_depths_labotest(arr: np.ndarray, labels: list[str]):
     zone = labotest_lithology_zone(arr)
