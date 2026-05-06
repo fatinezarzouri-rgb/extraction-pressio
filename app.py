@@ -126,15 +126,14 @@ def render_page_to_array(doc, page_index: int, zoom: float = 2.0):
 def detect_sondage_name_labotest(arr: np.ndarray) -> str:
     h, w = arr.shape[:2]
 
-    # plusieurs zones proches de la case "Sondage : ..."
     crop_boxes = [
-        (0.29, 0.64, 0.145, 0.235),
-        (0.27, 0.62, 0.140, 0.230),
-        (0.31, 0.66, 0.145, 0.240),
-        (0.28, 0.60, 0.135, 0.220),
+        (0.29, 0.64, 0.145, 0.235),  # bon crop principal
+        (0.28, 0.63, 0.140, 0.230),
+        (0.30, 0.65, 0.145, 0.240),
+        (0.27, 0.62, 0.140, 0.225),
     ]
 
-    psm_modes = [6, 7, 11]
+    psm_modes = [6, 11]
 
     for bx1, bx2, by1, by2 in crop_boxes:
         x1 = int(w * bx1)
@@ -167,6 +166,19 @@ def detect_sondage_name_labotest(arr: np.ndarray) -> str:
                     return m.group(1).strip()
 
     return ""
+
+
+def labotest_lithology_zone(arr: np.ndarray):
+    return arr[430:1450, 240:470]
+
+
+def extract_labels_labotest(arr: np.ndarray):
+    zone = labotest_lithology_zone(arr)
+    text_crop = Image.fromarray(zone[:, 35:190])
+    txt = pytesseract.image_to_string(text_crop, config="--psm 6")
+    raw_lines = [ln.strip() for ln in txt.splitlines() if re.search(r"[A-Za-zÀ-ÿ]", ln)]
+    return parse_labels(raw_lines)
+
 
 def extract_depths_labotest(arr: np.ndarray, labels: list[str]):
     zone = labotest_lithology_zone(arr)
@@ -329,7 +341,7 @@ def extract_dataframe(pdf_bytes: bytes):
         sondage = detect_sondage_name_labotest(arr)
         if not sondage:
             undetected_pages.append(i + 1)
-            sondage = f"NON_DETECTE_PAGE_{i+1:03d}"
+            continue
 
         labels = extract_labels_labotest(arr)
         if not labels:
