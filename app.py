@@ -9,9 +9,12 @@ import pytesseract
 import streamlit as st
 from PIL import Image
 
-st.set_page_config(page_title="PDF -> Tableau lithologie", layout="wide")
+st.set_page_config(page_title="Extraction lithologie PDF", layout="wide")
 
 
+# -----------------------------
+# OUTILS TEXTE
+# -----------------------------
 def clean_text(s: str) -> str:
     rep = {
         "é": "e", "è": "e", "ê": "e", "ë": "e",
@@ -69,13 +72,6 @@ def normalize_label(label: str) -> str:
 
 
 def merge_split_lines(lines):
-    """
-    Fusionne les lithologies cassées sur 2 lignes par l'OCR.
-    Ex:
-    Roche / conglomératic
-    Argile a / matrice roche
-    Sable / graveleux
-    """
     merged = []
     i = 0
 
@@ -85,38 +81,24 @@ def merge_split_lines(lines):
 
         cur_n = clean_text(cur)
         nxt_n = clean_text(nxt)
-
         combo = cur
 
-        # roche + conglom / schisteuse / granitique
         if cur_n == "roche" and any(k in nxt_n for k in ["conglom", "schist", "granit"]):
             combo = cur + " " + nxt
             i += 1
 
-        # argile a + matrice roche
-        elif cur_n in ["argile a", "argile a matrice", "argile"] and (
-            "matrice" in nxt_n or "roche" in nxt_n
-        ):
-            full = clean_text(cur + " " + nxt)
-            if "argile" in full and ("matrice" in full or "roche" in full):
-                combo = cur + " " + nxt
-                i += 1
+        elif cur_n in ["argile a", "argile", "argile a matrice"] and ("matrice" in nxt_n or "roche" in nxt_n):
+            combo = cur + " " + nxt
+            i += 1
 
-        # sable a + matrice roche
-        elif cur_n in ["sable a", "sable a matrice", "sable"] and (
-            "matrice" in nxt_n or "roche" in nxt_n
-        ):
-            full = clean_text(cur + " " + nxt)
-            if "sable" in full and ("matrice" in full or "roche" in full):
-                combo = cur + " " + nxt
-                i += 1
+        elif cur_n in ["sable a", "sable", "sable a matrice"] and ("matrice" in nxt_n or "roche" in nxt_n):
+            combo = cur + " " + nxt
+            i += 1
 
-        # argile + graveleux
         elif cur_n == "argile" and "grave" in nxt_n:
             combo = cur + " " + nxt
             i += 1
 
-        # sable + graveleux / argileux
         elif cur_n == "sable" and ("grave" in nxt_n or "argileux" in nxt_n):
             combo = cur + " " + nxt
             i += 1
@@ -129,16 +111,17 @@ def merge_split_lines(lines):
 
 def parse_labels(lines):
     lines = merge_split_lines(lines)
-
     out = []
     for line in lines:
         lab = normalize_label(line)
         if lab and (not out or out[-1] != lab):
             out.append(lab)
-
     return out
 
 
+# -----------------------------
+# EXTRACTION NOM SONDAGE
+# -----------------------------
 def extract_sondage_name(page_text: str, page_number: int) -> str:
     text = page_text.replace("\n", " ")
 
@@ -159,6 +142,9 @@ def extract_sondage_name(page_text: str, page_number: int) -> str:
     return f"Sondage_{page_number:03d}"
 
 
+# -----------------------------
+# IMAGE PAGE
+# -----------------------------
 def render_page_to_array(doc, page_index: int, zoom: float = 2.0):
     page = doc[page_index]
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
@@ -166,12 +152,15 @@ def render_page_to_array(doc, page_index: int, zoom: float = 2.0):
     return arr
 
 
-def find_lithology_zone(arr: np.ndarray):
+# -----------------------------
+# MODE LABOTEST
+# -----------------------------
+def find_lithology_zone_labotest(arr: np.ndarray):
     return arr[430:1450, 240:470]
 
 
-def detect_labels(arr: np.ndarray):
-    zone = find_lithology_zone(arr)
+def detect_labels_labotest(arr: np.ndarray):
+    zone = find_lithology_zone_labotest(arr)
     text_crop = Image.fromarray(zone[:, 35:190])
     txt = pytesseract.image_to_string(text_crop, config="--psm 6")
     raw_lines = [ln.strip() for ln in txt.splitlines() if re.search(r"[A-Za-zÀ-ÿ]", ln)]
@@ -179,8 +168,8 @@ def detect_labels(arr: np.ndarray):
     return labels, txt
 
 
-def detect_boundaries(arr: np.ndarray, labels: list[str]):
-    zone = find_lithology_zone(arr)
+def detect_boundaries_labotest(arr: np.ndarray, labels: list[str]):
+    zone = find_lithology_zone_labotest(arr)
 
     r = zone[:, :, 0].astype(int)
     g = zone[:, :, 1].astype(int)
@@ -236,10 +225,71 @@ def detect_boundaries(arr: np.ndarray, labels: list[str]):
     return starts, ends
 
 
+# -----------------------------
+# MODE GENERIQUE
+# -----------------------------
+def find_lithology_zone_generic(arr: np.ndarray):
+    h, w = arr.shape[:2]
+    x1 = int(w * 0.08)
+    x2 = int(w * 0.40)
+    y1 = int(h * 0.20)
+    y2 = int(h * 0.92)
+    return arr[y1:y2, x1:x2], (y1, y2, x1, x2)
+
+
+def detect_labels_generic(arr: np.ndarray):
+    zone, _ = find_lithology_zone_generic(arr)
+    txt = pytesseract.image_to_string(Image.fromarray(zone), config="--psm 6")
+    raw_lines = [ln.strip() for ln in txt.splitlines() if re.search(r"[A-Za-zÀ-ÿ]", ln)]
+    labels = parse_labels(raw_lines)
+    return labels, txt
+
+
+def detect_boundaries_generic(arr: np.ndarray, labels: list[str]):
+    zone, _ = find_lithology_zone_generic(arr)
+
+    gray = np.mean(zone[:, :, :3], axis=2)
+    diff = np.abs(np.diff(gray, axis=0)).mean(axis=1)
+
+    idx = [i for i, v in enumerate(diff) if v > np.percentile(diff, 96)]
+    groups = []
+    for j in idx:
+        if not groups or j - groups[-1][-1] > 4:
+            groups.append([j])
+        else:
+            groups[-1].append(j)
+
+    centers = [round(sum(gp) / len(gp)) for gp in groups]
+
+    bounds = []
+    if len(zone) > 0:
+        for c in centers:
+            ratio = c / len(zone)
+            d = round((ratio * 15) * 2) / 2
+            if 0.2 <= d <= 14.8:
+                if not bounds or abs(d - bounds[-1]) > 0.5:
+                    bounds.append(d)
+
+    bounds = bounds[: max(len(labels) - 1, 0)]
+
+    starts = [0] + bounds
+    ends = bounds + [15]
+
+    if len(starts) > len(labels):
+        starts = starts[:len(labels)]
+        ends = ends[:len(labels)]
+
+    while len(starts) < len(labels):
+        starts.append("")
+        ends.append("")
+
+    return starts, ends
+
+
+# -----------------------------
+# POST TRAITEMENT
+# -----------------------------
 def fix_final_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Corrige les cas résiduels si une lithologie a encore été cassée.
-    """
     rows = []
     data = df.to_dict("records")
     i = 0
@@ -256,7 +306,6 @@ def fix_final_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             nxt_lith_n = clean_text(nxt_lith)
 
             if same_sondage:
-                # Roche + conglom...
                 if lith_n == "roche" and "conglom" in nxt_lith_n:
                     row["Lithologie"] = "Roche conglomératique"
                     row["Profondeur_fin (m)"] = nxt["Profondeur_fin (m)"]
@@ -278,27 +327,20 @@ def fix_final_dataframe(df: pd.DataFrame) -> pd.DataFrame:
                     i += 2
                     continue
 
-                # Argile a + matrice roche
-                if ("argile" in lith_n and ("a" == lith_n.split()[-1] or "matrice" in nxt_lith_n or "roche" in nxt_lith_n)):
-                    combo = clean_text(lith + " " + nxt_lith)
-                    if "argile" in combo and ("matrice" in combo or "roche" in combo):
-                        row["Lithologie"] = "Argile à matrice rocheuse"
-                        row["Profondeur_fin (m)"] = nxt["Profondeur_fin (m)"]
-                        rows.append(row)
-                        i += 2
-                        continue
+                if "argile" in lith_n and ("matrice" in nxt_lith_n or "roche" in nxt_lith_n):
+                    row["Lithologie"] = "Argile à matrice rocheuse"
+                    row["Profondeur_fin (m)"] = nxt["Profondeur_fin (m)"]
+                    rows.append(row)
+                    i += 2
+                    continue
 
-                # Sable a + matrice roche
-                if ("sable" in lith_n and ("a" == lith_n.split()[-1] or "matrice" in nxt_lith_n or "roche" in nxt_lith_n)):
-                    combo = clean_text(lith + " " + nxt_lith)
-                    if "sable" in combo and ("matrice" in combo or "roche" in combo):
-                        row["Lithologie"] = "Sable à matrice rocheuse"
-                        row["Profondeur_fin (m)"] = nxt["Profondeur_fin (m)"]
-                        rows.append(row)
-                        i += 2
-                        continue
+                if "sable" in lith_n and ("matrice" in nxt_lith_n or "roche" in nxt_lith_n):
+                    row["Lithologie"] = "Sable à matrice rocheuse"
+                    row["Profondeur_fin (m)"] = nxt["Profondeur_fin (m)"]
+                    rows.append(row)
+                    i += 2
+                    continue
 
-                # Argile + graveleux
                 if lith_n == "argile" and "grave" in nxt_lith_n:
                     row["Lithologie"] = "Argile graveleux"
                     row["Profondeur_fin (m)"] = nxt["Profondeur_fin (m)"]
@@ -306,9 +348,8 @@ def fix_final_dataframe(df: pd.DataFrame) -> pd.DataFrame:
                     i += 2
                     continue
 
-                # Sable + graveleux
-                if lith_n == "sable" and "grave" in nxt_lith_n:
-                    row["Lithologie"] = "Sable graveleux"
+                if lith_n == "sable" and ("grave" in nxt_lith_n or "argileux" in nxt_lith_n):
+                    row["Lithologie"] = "Sable graveleux" if "grave" in nxt_lith_n else "Sable argileux"
                     row["Profondeur_fin (m)"] = nxt["Profondeur_fin (m)"]
                     rows.append(row)
                     i += 2
@@ -322,14 +363,12 @@ def fix_final_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         i += 1
 
     out = pd.DataFrame(rows)
-
-    # nettoyage des profondeurs vides
     out = out[out["Lithologie"].astype(str).str.strip() != ""]
     out = out.reset_index(drop=True)
     return out
 
 
-def extract_dataframe(pdf_bytes: bytes) -> pd.DataFrame:
+def extract_dataframe(pdf_bytes: bytes, mode: str) -> pd.DataFrame:
     tmp_pdf = Path("tmp_upload.pdf")
     tmp_pdf.write_bytes(pdf_bytes)
 
@@ -340,14 +379,17 @@ def extract_dataframe(pdf_bytes: bytes) -> pd.DataFrame:
         page = doc[i]
         page_text = page.get_text("text")
         sondage = extract_sondage_name(page_text, i + 1)
-
         arr = render_page_to_array(doc, i, zoom=2)
-        labels, raw_ocr = detect_labels(arr)
+
+        if mode == "Labotest":
+            labels, raw_ocr = detect_labels_labotest(arr)
+            starts, ends = detect_boundaries_labotest(arr, labels) if labels else ([], [])
+        else:
+            labels, raw_ocr = detect_labels_generic(arr)
+            starts, ends = detect_boundaries_generic(arr, labels) if labels else ([], [])
 
         if not labels:
             continue
-
-        starts, ends = detect_boundaries(arr, labels)
 
         for lith, z1, z2 in zip(labels, starts, ends):
             rows.append({
@@ -355,8 +397,8 @@ def extract_dataframe(pdf_bytes: bytes) -> pd.DataFrame:
                 "Lithologie": lith,
                 "Profondeur_debut (m)": z1,
                 "Profondeur_fin (m)": z2,
-                "Source": sondage,   # au lieu de Page_001
                 "OCR_lithologie": raw_ocr.replace("\n", " | "),
+                "Mode": mode,
             })
 
     df = pd.DataFrame(rows)
@@ -365,7 +407,6 @@ def extract_dataframe(pdf_bytes: bytes) -> pd.DataFrame:
         return df
 
     df = fix_final_dataframe(df)
-
     return df
 
 
@@ -381,10 +422,19 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
+# -----------------------------
+# INTERFACE
+# -----------------------------
 st.title("Extraction lithologie depuis PDF")
-st.write("Importer uniquement le PDF des coupes pressiométriques.")
+st.write("Importer le PDF puis choisir le mode adapté.")
 
-pdf_file = st.file_uploader("PDF des coupes pressiométriques", type=["pdf"])
+mode = st.selectbox(
+    "Type de PDF",
+    ["Labotest", "Générique"],
+    index=0
+)
+
+pdf_file = st.file_uploader("PDF des coupes", type=["pdf"])
 
 if st.button("Lancer l'extraction", type="primary"):
     if pdf_file is None:
@@ -392,7 +442,7 @@ if st.button("Lancer l'extraction", type="primary"):
     else:
         try:
             with st.spinner("Extraction en cours..."):
-                df = extract_dataframe(pdf_file.read())
+                df = extract_dataframe(pdf_file.read(), mode)
 
             if df.empty:
                 st.warning("Aucune donnée détectée.")
@@ -411,7 +461,7 @@ if st.button("Lancer l'extraction", type="primary"):
                 st.download_button(
                     "Télécharger l'Excel",
                     data=excel_bytes,
-                    file_name="lithologie_sondages_depuis_pdf_corrige.xlsx",
+                    file_name="lithologie_sondages_depuis_pdf.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
