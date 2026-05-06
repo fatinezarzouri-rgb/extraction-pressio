@@ -9,12 +9,12 @@ import pytesseract
 import streamlit as st
 from PIL import Image
 
-st.set_page_config(page_title="Extraction lithologie PDF", layout="wide")
+st.set_page_config(page_title="Extraction Labotest", layout="wide")
 
 
-# =========================================================
+# -------------------------------------------------
 # OUTILS TEXTE
-# =========================================================
+# -------------------------------------------------
 def clean_text(s: str) -> str:
     rep = {
         "é": "e", "è": "e", "ê": "e", "ë": "e",
@@ -27,7 +27,7 @@ def clean_text(s: str) -> str:
     s = s.lower()
     for a, b in rep.items():
         s = s.replace(a, b)
-    s = re.sub(r"[^a-z0-9\-\s_/]", " ", s)
+    s = re.sub(r"[^a-z0-9_\-\s/]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -71,14 +71,6 @@ def normalize_label(label: str) -> str:
         return "Argile"
     if t == "sable":
         return "Sable"
-    if t == "tirs":
-        return "Tirs"
-    if "gres" in t and "lumachell" in t:
-        return "Grès lumachellique"
-    if "marne" in t and "verd" in t:
-        return "Marne verdâtre avec traces bariolée d'oxydations"
-    if "schiste" in t and "fractur" in t:
-        return "Schiste dur fracturé à fracturations sub-horizontales"
 
     return normalize_spaces(label)
 
@@ -98,32 +90,18 @@ def merge_split_lines(lines):
         if cur_n == "roche" and any(k in nxt_n for k in ["conglom", "schist", "granit"]):
             combo = f"{cur} {nxt}"
             i += 1
-
         elif cur_n in ["argile", "argile a", "argile a matrice"] and ("matrice" in nxt_n or "roche" in nxt_n):
             combo = f"{cur} {nxt}"
             i += 1
-
         elif cur_n in ["sable", "sable a", "sable a matrice"] and ("matrice" in nxt_n or "roche" in nxt_n):
             combo = f"{cur} {nxt}"
             i += 1
-
         elif cur_n == "argile" and "grave" in nxt_n:
             combo = f"{cur} {nxt}"
             i += 1
-
         elif cur_n == "sable" and ("grave" in nxt_n or "argileux" in nxt_n):
             combo = f"{cur} {nxt}"
             i += 1
-
-        elif "marne" in cur_n and i + 1 < len(lines):
-            if any(x in nxt_n for x in ["bariolee", "oxydation", "traces"]):
-                combo = f"{cur} {nxt}"
-                i += 1
-
-        elif "schiste" in cur_n and i + 1 < len(lines):
-            if "fractur" in nxt_n:
-                combo = f"{cur} {nxt}"
-                i += 1
 
         merged.append(combo)
         i += 1
@@ -141,61 +119,9 @@ def parse_labels(lines):
     return out
 
 
-# =========================================================
-# NOM EXACT DU SONDAGE
-# =========================================================
-def extract_exact_sondage_name(page_text: str, arr: np.ndarray, page_number: int) -> str:
-    txt = page_text.replace("\n", " ")
-
-    patterns = [
-        r"Sondage\s+pressiometrique\s+Menard\s*[:\-]?\s*([A-Za-z0-9_\-\/]+)",
-        r"Sondage\s+pressiom[eé]trique\s+M[eé]nard\s*[:\-]?\s*([A-Za-z0-9_\-\/]+)",
-        r"Sondage\s*[:\-]?\s*(SP[_\-\s]?(?:Rem|Reta)\d+)",
-        r"(SP[_\-\s]?(?:Rem|Reta)\d+)",
-        r"(T\d+\-SCP\-EXE\-\d+)",
-        r"(T\d+\-[A-Za-z0-9\-]+)",
-    ]
-
-    for pat in patterns:
-        m = re.search(pat, txt, flags=re.IGNORECASE)
-        if m:
-            val = m.group(1).strip()
-            val = val.replace(" ", "_")
-            val = re.sub(r"_+", "_", val)
-            val = re.sub(r"(?i)^sp[_\- ]?rem[_\- ]?(\d+)$", lambda x: f"SP_Rem{int(x.group(1)):03d}", val)
-            val = re.sub(r"(?i)^sp[_\- ]?reta[_\- ]?(\d+)$", lambda x: f"SP_Reta{int(x.group(1)):03d}", val)
-            return val
-
-    h, w = arr.shape[:2]
-    header_crop = arr[40:int(h * 0.22), int(w * 0.22):int(w * 0.88)]
-    header_img = Image.fromarray(header_crop)
-
-    ocr_txt = pytesseract.image_to_string(header_img, config="--psm 6")
-    ocr_txt = ocr_txt.replace("\n", " ")
-
-    ocr_patterns = [
-        r"(SP[_\-\s]?(?:Rem|Reta)\d+)",
-        r"Sondage\s+pressiom[eé]trique\s+M[eé]nard\s*[:\-]?\s*([A-Za-z0-9_\-\/]+)",
-        r"(T\d+\-SCP\-EXE\-\d+)",
-        r"(T\d+\-[A-Za-z0-9\-]+)",
-    ]
-
-    for pat in ocr_patterns:
-        m = re.search(pat, ocr_txt, flags=re.IGNORECASE)
-        if m:
-            val = m.group(1).strip()
-            val = val.replace(" ", "_")
-            val = re.sub(r"_+", "_", val)
-            val = re.sub(r"(?i)^sp[_\- ]?rem[_\- ]?(\d+)$", lambda x: f"SP_Rem{int(x.group(1)):03d}", val)
-            val = re.sub(r"(?i)^sp[_\- ]?reta[_\- ]?(\d+)$", lambda x: f"SP_Reta{int(x.group(1)):03d}", val)
-            return val
-
-    return f"Sondage_{page_number:03d}"
-
-
-# =========================================================
-# IMAGE PAGE
-# =========================================================
+# -------------------------------------------------
+# IMAGE
+# -------------------------------------------------
 def render_page_to_array(doc, page_index: int, zoom: float = 2.0):
     page = doc[page_index]
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
@@ -203,22 +129,40 @@ def render_page_to_array(doc, page_index: int, zoom: float = 2.0):
     return arr
 
 
-# =========================================================
-# DETECTION TYPE PDF
-# =========================================================
-def detect_pdf_type(page_text: str) -> str:
-    t = clean_text(page_text)
+# -------------------------------------------------
+# NOM EXACT DU SONDAGE - LABOTEST SEULEMENT
+# -------------------------------------------------
+def extract_labotest_name_from_header(arr: np.ndarray):
+    h, w = arr.shape[:2]
 
-    if "labotest" in t:
-        return "LABOTEST"
-    if "laboratoire public d essais" in t or "centre experimental des sols" in t or "jean lutz" in t:
-        return "LPEE"
-    return "GENERIC"
+    # zone de la case jaune
+    x1 = int(w * 0.33)
+    x2 = int(w * 0.56)
+    y1 = int(h * 0.08)
+    y2 = int(h * 0.16)
+
+    crop = arr[y1:y2, x1:x2]
+    crop_img = Image.fromarray(crop).resize((crop.shape[1] * 4, crop.shape[0] * 4))
+
+    txt = pytesseract.image_to_string(crop_img, config="--psm 7")
+    txt = txt.replace("\n", " ").strip()
+
+    # exemple: Sondage : SP_Rem_001
+    m = re.search(r"Sondage\s*:\s*([A-Za-z0-9_\-\/]+)", txt, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    # secours: si l'OCR lit juste le nom
+    m = re.search(r"(SP[_\-]?[A-Za-z0-9_\-]+)", txt, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    return None
 
 
-# =========================================================
-# LABOTEST
-# =========================================================
+# -------------------------------------------------
+# LABOTEST : LITHOLOGIE
+# -------------------------------------------------
 def labotest_lithology_zone(arr: np.ndarray):
     return arr[430:1450, 240:470]
 
@@ -273,7 +217,7 @@ def extract_depths_labotest(arr: np.ndarray, labels: list[str]):
             bounds[0] = 0.5
 
     bounds = sorted(set(round(float(b) * 2) / 2 for b in bounds if 0 < b < 15))
-    bounds = bounds[: max(len(labels) - 1, 0)]
+    bounds = bounds[:max(len(labels) - 1, 0)]
 
     starts = [0] + bounds
     ends = bounds + [15]
@@ -289,155 +233,9 @@ def extract_depths_labotest(arr: np.ndarray, labels: list[str]):
     return starts, ends
 
 
-# =========================================================
-# LPEE / CES
-# =========================================================
-def extract_lpee_breaks_from_text(page_text: str):
-    lines = [normalize_spaces(x) for x in page_text.splitlines() if normalize_spaces(x)]
-
-    depth_candidates = []
-    after_prof = False
-    for ln in lines:
-        ln_n = clean_text(ln)
-
-        if "prof sous" in ln_n or "tn" in ln_n:
-            after_prof = True
-            continue
-
-        if after_prof:
-            m = re.fullmatch(r"(\d+(?:\.\d+)?)", ln.strip())
-            if m:
-                val = float(m.group(1))
-                if 0 < val <= 100:
-                    depth_candidates.append(val)
-
-        if "lithologie" in ln_n:
-            break
-
-    depths = []
-    for d in depth_candidates:
-        if not depths or d > depths[-1]:
-            depths.append(d)
-
-    labels = []
-    start_labels = False
-    stop_words = [
-        "tubage", "couronne", "pression de fluage",
-        "pression limite", "module pressiometrique",
-        "e/pl", "pf", "pl", "em"
-    ]
-
-    for ln in lines:
-        ln_n = clean_text(ln)
-
-        if ln_n == "lithologie":
-            start_labels = True
-            continue
-
-        if start_labels:
-            if any(w in ln_n for w in stop_words):
-                break
-
-            if re.search(r"[A-Za-zÀ-ÿ]", ln):
-                labels.append(ln)
-
-    labels = parse_labels(labels)
-
-    return depths, labels
-
-
-def extract_lpee_data(page_text: str):
-    total_depth = None
-
-    m = re.search(r"Profondeur\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*m", page_text, flags=re.IGNORECASE)
-    if m:
-        total_depth = float(m.group(1))
-
-    breaks, labels = extract_lpee_breaks_from_text(page_text)
-
-    if not labels:
-        return [], [], [], ""
-
-    if total_depth is None:
-        total_depth = breaks[-1] if breaks else 15.0
-
-    if len(breaks) >= len(labels):
-        ends = breaks[:len(labels)]
-        starts = [0.0] + ends[:-1]
-    else:
-        starts = [0.0]
-        for _ in range(len(labels) - 1):
-            starts.append("")
-        ends = ["" for _ in labels]
-        if ends:
-            ends[-1] = total_depth
-
-    if len(ends) == len(labels) and ends[-1] == "":
-        ends[-1] = total_depth
-
-    return labels, starts, ends, "LPEE_TEXT"
-
-
-# =========================================================
-# GENERIQUE
-# =========================================================
-def generic_lithology_zone(arr: np.ndarray):
-    h, w = arr.shape[:2]
-    x1 = int(w * 0.07)
-    x2 = int(w * 0.38)
-    y1 = int(h * 0.18)
-    y2 = int(h * 0.92)
-    return arr[y1:y2, x1:x2]
-
-
-def extract_generic_data(arr: np.ndarray):
-    zone = generic_lithology_zone(arr)
-
-    txt = pytesseract.image_to_string(Image.fromarray(zone), config="--psm 6")
-    raw_lines = [ln.strip() for ln in txt.splitlines() if re.search(r"[A-Za-zÀ-ÿ]", ln)]
-    labels = parse_labels(raw_lines)
-
-    gray = np.mean(zone[:, :, :3], axis=2)
-    diff = np.abs(np.diff(gray, axis=0)).mean(axis=1)
-
-    idx = [i for i, v in enumerate(diff) if v > np.percentile(diff, 96)]
-    groups = []
-    for j in idx:
-        if not groups or j - groups[-1][-1] > 4:
-            groups.append([j])
-        else:
-            groups[-1].append(j)
-
-    centers = [round(sum(gp) / len(gp)) for gp in groups]
-
-    bounds = []
-    if len(zone) > 0:
-        for c in centers:
-            ratio = c / len(zone)
-            d = round((ratio * 15) * 2) / 2
-            if 0.2 <= d <= 14.8:
-                if not bounds or abs(d - bounds[-1]) > 0.5:
-                    bounds.append(d)
-
-    bounds = bounds[: max(len(labels) - 1, 0)]
-
-    starts = [0] + bounds
-    ends = bounds + [15]
-
-    if len(starts) > len(labels):
-        starts = starts[:len(labels)]
-        ends = ends[:len(labels)]
-
-    while len(starts) < len(labels):
-        starts.append("")
-        ends.append("")
-
-    return labels, starts, ends, txt
-
-
-# =========================================================
-# POST TRAITEMENT
-# =========================================================
+# -------------------------------------------------
+# POST-TRAITEMENT
+# -------------------------------------------------
 def fix_final_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     data = df.to_dict("records")
@@ -511,10 +309,7 @@ def fix_final_dataframe(df: pd.DataFrame) -> pd.DataFrame:
                     i += 2
                     continue
 
-        if lith_n in [
-            "graveleux", "graveleuse", "matrice roche", "matrice rocheuse",
-            "conglomeratic", "conglomeratique"
-        ]:
+        if lith_n in ["graveleux", "graveleuse", "matrice roche", "matrice rocheuse", "conglomeratic", "conglomeratique"]:
             i += 1
             continue
 
@@ -539,9 +334,9 @@ def normalize_depth_value(v):
         return v
 
 
-# =========================================================
-# EXTRACTION GLOBALE
-# =========================================================
+# -------------------------------------------------
+# EXTRACTION GLOBALE LABOTEST
+# -------------------------------------------------
 def extract_dataframe(pdf_bytes: bytes) -> pd.DataFrame:
     tmp_pdf = Path("tmp_upload.pdf")
     tmp_pdf.write_bytes(pdf_bytes)
@@ -550,28 +345,17 @@ def extract_dataframe(pdf_bytes: bytes) -> pd.DataFrame:
     rows = []
 
     for i in range(len(doc)):
-        page = doc[i]
-        page_text = page.get_text("text")
         arr = render_page_to_array(doc, i, zoom=2)
 
-        sondage = extract_exact_sondage_name(page_text, arr, i + 1)
-        pdf_type = detect_pdf_type(page_text)
+        sondage = extract_labotest_name_from_header(arr)
+        if not sondage:
+            sondage = f"Sondage_{i + 1:03d}"
 
-        if pdf_type == "LPEE":
-            labels, starts, ends, source = extract_lpee_data(page_text)
-        else:
-            if pdf_type == "LABOTEST":
-                labels, raw_ocr = extract_labels_labotest(arr)
-                if labels:
-                    starts, ends = extract_depths_labotest(arr, labels)
-                else:
-                    starts, ends = [], []
-                source = raw_ocr
-            else:
-                labels, starts, ends, source = extract_generic_data(arr)
-
+        labels, _ = extract_labels_labotest(arr)
         if not labels:
             continue
+
+        starts, ends = extract_depths_labotest(arr, labels)
 
         for lith, z1, z2 in zip(labels, starts, ends):
             rows.append({
@@ -579,7 +363,6 @@ def extract_dataframe(pdf_bytes: bytes) -> pd.DataFrame:
                 "Lithologie": lith,
                 "Profondeur_debut (m)": normalize_depth_value(z1),
                 "Profondeur_fin (m)": normalize_depth_value(z2),
-                "Type_PDF": pdf_type,
             })
 
     df = pd.DataFrame(rows)
@@ -596,21 +379,20 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Lithologie")
         resume = df.groupby("Sondage", as_index=False).agg(
-            Nb_couches=("Lithologie", "size"),
-            Type_PDF=("Type_PDF", "first"),
+            Nb_couches=("Lithologie", "size")
         )
         resume.to_excel(writer, index=False, sheet_name="Resume")
     output.seek(0)
     return output.getvalue()
 
 
-# =========================================================
-# INTERFACE STREAMLIT
-# =========================================================
-st.title("Extraction lithologie depuis PDF")
-st.write("Importe un PDF Labotest ou LPEE/CES. Le nom exact du sondage sera conservé.")
+# -------------------------------------------------
+# STREAMLIT
+# -------------------------------------------------
+st.title("Extraction lithologie Labotest")
+st.write("Importer uniquement un PDF Labotest. Le nom du sondage est lu dans la case 'Sondage :'.")
 
-pdf_file = st.file_uploader("PDF", type=["pdf"])
+pdf_file = st.file_uploader("PDF Labotest", type=["pdf"])
 
 if st.button("Lancer l'extraction", type="primary"):
     if pdf_file is None:
@@ -628,7 +410,6 @@ if st.button("Lancer l'extraction", type="primary"):
                     "Lithologie",
                     "Profondeur_debut (m)",
                     "Profondeur_fin (m)",
-                    "Type_PDF",
                 ]
                 st.success(f"Extraction terminée : {len(df)} lignes")
                 st.dataframe(df[show_cols], use_container_width=True)
@@ -638,7 +419,7 @@ if st.button("Lancer l'extraction", type="primary"):
                 st.download_button(
                     "Télécharger l'Excel",
                     data=excel_bytes,
-                    file_name="lithologie_sondages_mixte.xlsx",
+                    file_name="lithologie_labotest.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
