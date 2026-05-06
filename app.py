@@ -9,7 +9,7 @@ import pytesseract
 import streamlit as st
 from PIL import Image, ImageFilter
 
-st.set_page_config(page_title="Extraction Labotest", layout="wide")
+st.set_page_config(page_title="Extraction lithologie Labotest", layout="wide")
 
 
 def clean_text(s: str) -> str:
@@ -75,6 +75,7 @@ def normalize_label(label: str) -> str:
 def merge_split_lines(lines):
     merged = []
     i = 0
+
     while i < len(lines):
         cur = normalize_spaces(lines[i])
         nxt = normalize_spaces(lines[i + 1]) if i + 1 < len(lines) else ""
@@ -101,6 +102,7 @@ def merge_split_lines(lines):
 
         merged.append(combo)
         i += 1
+
     return merged
 
 
@@ -127,46 +129,54 @@ def preprocess_for_ocr(img: Image.Image):
     gray = img.convert("L")
     variants.append(gray)
 
-    bw1 = gray.point(lambda p: 255 if p > 180 else 0)
-    bw2 = gray.point(lambda p: 255 if p > 150 else 0)
+    bw1 = gray.point(lambda p: 255 if p > 170 else 0)
+    bw2 = gray.point(lambda p: 255 if p > 145 else 0)
 
     variants.append(bw1)
     variants.append(bw2)
-
     variants.append(gray.filter(ImageFilter.SHARPEN))
-    variants.append(gray.resize((gray.width * 3, gray.height * 3)))
-    variants.append(bw1.resize((bw1.width * 3, bw1.height * 3)))
-    variants.append(bw2.resize((bw2.width * 3, bw2.height * 3)))
-    variants.append(gray.filter(ImageFilter.SHARPEN).resize((gray.width * 4, gray.height * 4)))
+    variants.append(gray.resize((gray.width * 4, gray.height * 4)))
+    variants.append(bw1.resize((bw1.width * 4, bw1.height * 4)))
+    variants.append(bw2.resize((bw2.width * 4, bw2.height * 4)))
+    variants.append(gray.filter(ImageFilter.SHARPEN).resize((gray.width * 5, gray.height * 5)))
 
     return variants
 
 
-def detect_sondage_name_labotest(arr: np.ndarray):
+def detect_sondage_name_labotest(arr: np.ndarray) -> str:
     h, w = arr.shape[:2]
 
-    # crop exact dyal case "Sondage : ..."
-    # had l-values a9rab l screenshot li sifti
+    # crop de la case "Sondage : ..."
     x1 = int(w * 0.37)
     x2 = int(w * 0.60)
     y1 = int(h * 0.105)
     y2 = int(h * 0.165)
 
     crop = arr[y1:y2, x1:x2]
-    img = Image.fromarray(crop).convert("L")
-    img = img.resize((img.width * 5, img.height * 5))
+    base_img = Image.fromarray(crop)
 
-    # binarisation bach ywli lktaba wdha
-    img = img.point(lambda p: 255 if p > 170 else 0)
+    variants = preprocess_for_ocr(base_img)
+    psm_modes = [7, 6, 11]
 
-    txt = pytesseract.image_to_string(img, config="--psm 7")
-    txt = txt.replace("\n", " ").strip()
+    patterns = [
+        r"Sondage\s*:\s*([A-Za-z0-9_\-/]+)",
+        r"Sondage\s+([A-Za-z0-9_\-/]+)",
+        r"(SP[_\-]?[A-Za-z0-9_\-]+)",
+        r"([A-Za-z]{1,15}[_\-]?[A-Za-z0-9_\-]+)",
+    ]
 
-    m = re.search(r"Sondage\s*:\s*([A-Za-z0-9_\-/]+)", txt, flags=re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
+    for img in variants:
+        for psm in psm_modes:
+            txt = pytesseract.image_to_string(img, config=f"--psm {psm}")
+            txt = txt.replace("\n", " ").strip()
+
+            for pat in patterns:
+                m = re.search(pat, txt, flags=re.IGNORECASE)
+                if m:
+                    return m.group(1).strip()
 
     return ""
+
 
 def labotest_lithology_zone(arr: np.ndarray):
     return arr[430:1450, 240:470]
@@ -339,7 +349,7 @@ def extract_dataframe(pdf_bytes: bytes):
     for i in range(len(doc)):
         arr = render_page_to_array(doc, i, zoom=2)
 
-        sondage, ocr_name_debug = detect_sondage_name_labotest(arr)
+        sondage = detect_sondage_name_labotest(arr)
         if not sondage:
             undetected_pages.append(i + 1)
             continue
@@ -374,7 +384,7 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
 
 
 st.title("Extraction lithologie Labotest")
-st.write("Version détection seulement du nom du sondage dans la case 'Sondage :'.")
+st.write("Version Labotest seulement. Détection réelle du nom dans la case 'Sondage :'.")
 
 pdf_file = st.file_uploader("PDF Labotest", type=["pdf"])
 
