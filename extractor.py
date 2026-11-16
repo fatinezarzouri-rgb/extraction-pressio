@@ -2,16 +2,19 @@
 """
 Extraction générale des coupes d'essais pressiométriques (PDF -> tableau).
  
-Principe (aucune coordonnée fixe, aucun nom de lithologie codé en dur) :
-1. On lit les mots du PDF avec leurs positions (texte natif, sinon OCR).
-2. On repère les en-têtes "Pf", "Pl", "Em" -> cela donne les 3 colonnes de valeurs.
-3. On repère les graduations de profondeur (0, 1, 2 ... 16) -> axe profondeur <-> position y.
-4. On détecte les traits roses/rouges qui séparent les couches dans la colonne
-   "Lithologie" (analyse de l'image) -> limites des couches.
-5. Chaque ligne d'essai (Pf, Pl, Em) reçoit une profondeur et la lithologie de sa couche.
+Les coupes sont des IMAGES (pas de texte dans le PDF). La méthode est donc :
+1. Géométrie par analyse d'image (aucune coordonnée fixe) :
+   - lignes verticales longues  -> colonnes Pf | Pl | Em et colonne Lithologie
+   - lignes horizontales        -> haut (0 m) et bas du graphique -> axe de profondeur
+   - traits roses               -> limites des couches de lithologie
+2. OCR ciblé sur de petites zones (valeurs, nom du sondage, libellés de couches).
+   Si le PDF contient du vrai texte dans ces zones, il est utilisé à la place de l'OCR.
+3. Chaque ligne d'essai reçoit sa profondeur (grille de `step` m) et la lithologie
+   de la couche correspondante.
 """
+import difflib
 import re
-import unicodedata
+from collections import Counter
 from io import BytesIO
  
 import fitz  # PyMuPDF
@@ -23,12 +26,12 @@ try:
     from PIL import Image
  
     OCR_AVAILABLE = True
-except Exception:  # OCR facultatif
+except Exception:
     OCR_AVAILABLE = False
  
 ZOOM = 3
-NUM_RE = re.compile(r"^\d+(?:[.,]\d+)?$")
-INT_RE = re.compile(r"^\d{1,2}$")
+TEXT_BAND_FRAC = 0.41  # largeur (en fraction de la zone de mesures) de la zone de texte lithologie
+NUM_RE = re.compile(r"^\d+(?:\.\d+)?$")
  
  
 class PageSkip(Exception):
@@ -44,16 +47,6 @@ def cx(w):
  
 def cy(w):
     return (w[1] + w[3]) / 2
- 
- 
-def norm(s: str) -> str:
-    s = unicodedata.normalize("NFD", s)
-    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
-    return s.lower().strip()
- 
- 
-def to_float(s: str) -> float:
-    return float(s.replace(",", "."))
  
  
 def cluster_1d(items, key, tol):
@@ -77,234 +70,307 @@ def join_words(ws):
     ).strip()
  
  
-# --------------------------------------------------------------------------- #
-# Lecture des mots (texte natif, sinon OCR)
-# --------------------------------------------------------------------------- #
-def get_words(page):
-    words = [
-        (w[0], w[1], w[2], w[3], w[4].strip())
-        for w in page.get_text("words")
-        if w[4].strip()
-    ]
-    if len(words) >= 15:
-        return words, "texte"
- 
-    if OCR_AVAILABLE:
-        pix = page.get_pixmap(matrix=fitz.Matrix(ZOOM, ZOOM), alpha=False)
-        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-        try:
-            d = pytesseract.image_to_data(
-                img, lang="fra", config="--psm 11", output_type=pytesseract.Output.DICT
-            )
-        except Exception:
-            d = pytesseract.image_to_data(
-                img, config="--psm 11", output_type=pytesseract.Output.DICT
-            )
-        out = []
-        for i, t in enumerate(d["text"]):
-            t = t.strip()
-            if not t:
-                continue
-            x, y, w, h = d["left"][i], d["top"][i], d["width"][i], d["height"][i]
-            out.append((x / ZOOM, y / ZOOM, (x + w) / ZOOM, (y + h) / ZOOM, t))
-        return out, "ocr"
- 
-    return words, "texte"
- 
- 
-def detect_name(page, words, fallback):
-    texts = [page.get_text("text"), " ".join(w[4] for w in words)]
-    for txt in texts:
-        m = re.search(r"Sondage\s*:\s*([A-Za-z0-9_\-/.]+)", txt, flags=re.I)
-        if m:
-            return m.group(1).strip()
-    for txt in texts:
-        m = re.search(r"\b(S[A-Z]?[_\-][A-Za-z]+[_\-]?\d{1,4})\b", txt)
-        if m:
-            return m.group(1)
-    return fallback
+def clean_label(s: str) -> str:
+    s = re.sub(r"[^A-Za-zÀ-ÿ'’\- ]", " ", s)
+    toks = [t for t in s.split() if len(t) > 1 or t.lower() in ("a", "à")]
+    s = " ".join(toks)
+    s = re.sub(r"(?<=\w) a (?=\w)", " à ", s)
+    return s[:1].upper() + s[1:] if s else ""
  
  
 def format_name(name: str, compact: bool) -> str:
     """SP_Rem_001 -> SP_Rem001 si compact."""
+    name = name.strip("._-/ ")
+    m = re.match(r"^(.*?)([_\-]?)([0-9OolI|]{1,4})$", name)
+    if m:  # corrige O->0, l/I->1 dans la partie numérique
+        digits = m.group(3).translate(str.maketrans("OolI|", "00111"))
+        name = m.group(1) + m.group(2) + digits
     if compact:
-        return re.sub(r"[_\-](\d+)$", r"\1", name)
+        name = re.sub(r"[_\-](\d+)$", r"\1", name)
     return name
  
  
 # --------------------------------------------------------------------------- #
-# Détection des limites de couches (traits roses/rouges dans la colonne lithologie)
+# Image : rendu, lignes verticales / horizontales, traits roses
 # --------------------------------------------------------------------------- #
-def detect_boundaries(page, x_lo, x_hi, y_lo, y_hi):
+def render(page):
     pix = page.get_pixmap(matrix=fitz.Matrix(ZOOM, ZOOM), alpha=False)
     arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-    arr = arr[:, :, :3].astype(int)
+    return arr[:, :, :3]
  
-    ya, yb = max(int(y_lo * ZOOM), 0), min(int(y_hi * ZOOM), arr.shape[0])
-    xa, xb = max(int(x_lo * ZOOM), 0), min(int(x_hi * ZOOM), arr.shape[1])
-    if yb <= ya or xb <= xa:
-        return []
  
-    sub = arr[ya:yb, xa:xb]
+def longest_run(col, maxgap=6):
+    idx = np.flatnonzero(col)
+    if idx.size == 0:
+        return 0, 0, 0
+    breaks = np.where(np.diff(idx) > maxgap + 1)[0]
+    starts = np.concatenate(([0], breaks + 1))
+    ends = np.concatenate((breaks, [idx.size - 1]))
+    lens = idx[ends] - idx[starts] + 1
+    i = int(lens.argmax())
+    return int(lens[i]), int(idx[starts[i]]), int(idx[ends[i]])
+ 
+ 
+def find_vertical_lines(ink, min_len):
+    colsum = ink.sum(axis=0)
+    cand = []
+    for x in np.flatnonzero(colsum >= min_len):
+        n, y0, y1 = longest_run(ink[:, x])
+        if n >= min_len:
+            cand.append((int(x), y0, y1))
+    lines = []
+    for grp in cluster_1d(cand, key=lambda c: c[0], tol=4):
+        best = max(grp, key=lambda c: c[2] - c[1])
+        lines.append((float(np.mean([c[0] for c in grp])), best[1], best[2]))
+    return lines
+ 
+ 
+def find_plot_frame(gray_ink, x0, x1):
+    band = gray_ink[:, int(x0):int(x1)]
+    frac = band.mean(axis=1)
+    rows = np.flatnonzero(frac > 0.85)
+    if rows.size == 0:
+        raise PageSkip("cadre horizontal du graphique introuvable")
+    ys = [float(np.mean(g)) for g in cluster_1d(list(rows), key=lambda v: v, tol=3)]
+    if len(ys) < 2:
+        raise PageSkip("cadre horizontal du graphique introuvable")
+    i = int(np.argmax(np.diff(ys)))
+    return ys[i], ys[i + 1]
+ 
+ 
+def detect_boundaries(arr, x0, x1, top, bottom):
+    sub = arr[int(top):int(bottom), int(x0):int(x1)].astype(np.int16)
     r, g, b = sub[:, :, 0], sub[:, :, 1], sub[:, :, 2]
-    mask = (r >= 180) & ((r - g) >= 40) & ((r - b) >= 40)
+    mask = (r >= 200) & ((r - g) >= 15) & ((r - b) >= 15)
     frac = mask.mean(axis=1)
-    rows = np.where(frac > 0.5)[0]
-    if len(rows) == 0:
+    rows = np.flatnonzero(frac > 0.4)
+    if rows.size == 0:
         return []
+    return [top + float(np.mean(g_)) for g_ in cluster_1d(list(rows), key=lambda v: v, tol=4)]
  
-    groups = cluster_1d(list(rows), key=lambda v: v, tol=3)
-    return [y_lo + float(np.mean(g_)) / ZOOM + (ya / ZOOM - y_lo) for g_ in groups]
+ 
+# --------------------------------------------------------------------------- #
+# Lecture de texte : texte natif si présent, sinon OCR ciblé
+# --------------------------------------------------------------------------- #
+def native_words(page, rect):
+    r = fitz.Rect(*[v / ZOOM for v in rect])
+    return [
+        (w[0] * ZOOM, w[1] * ZOOM, w[2] * ZOOM, w[3] * ZOOM, w[4].strip())
+        for w in page.get_text("words", clip=r)
+        if w[4].strip()
+    ]
+ 
+ 
+def ocr_crop(dark, rect, psm=6, whitelist=None, lang=None, thr=150, erase_cols=()):
+    if not OCR_AVAILABLE:
+        return []
+    x0, y0, x1, y1 = [int(v) for v in rect]
+    x0, y0 = max(x0, 0), max(y0, 0)
+    crop = dark[y0:y1, x0:x1]
+    if crop.size == 0:
+        return []
+    bw = np.where(crop < thr, 0, 255).astype(np.uint8)
+    for ex in erase_cols:
+        a, b = int(ex - x0 - 5), int(ex - x0 + 6)
+        bw[:, max(a, 0):max(b, 0)] = 255
+    pad = 20
+    bw = np.pad(bw, pad, constant_values=255)
+    img = Image.fromarray(bw)
+ 
+    cfg = f"--psm {psm}"
+    if whitelist:
+        cfg += f" -c tessedit_char_whitelist={whitelist}"
+    kw = {"config": cfg, "output_type": pytesseract.Output.DICT}
+    if lang:
+        kw["lang"] = lang
+    try:
+        d = pytesseract.image_to_data(img, **kw)
+    except Exception:
+        kw.pop("lang", None)
+        d = pytesseract.image_to_data(img, **kw)
+ 
+    words = []
+    for i, t in enumerate(d["text"]):
+        t = str(t).strip()
+        if not t:
+            continue
+        l = d["left"][i] - pad + x0
+        tp = d["top"][i] - pad + y0
+        words.append((l, tp, l + d["width"][i], tp + d["height"][i], t))
+    return words
+ 
+ 
+def read_words(page, dark, rect, **ocr_kw):
+    ws = native_words(page, rect)
+    return ws if ws else ocr_crop(dark, rect, **ocr_kw)
+ 
+ 
+def read_sondage_name(page, dark, rect):
+    txt = page.get_text("text")
+    pats = [r"Sondage\s*[:;.]?\s*([A-Za-z0-9_\-/]+)"]
+    for src in [txt]:
+        for p in pats:
+            m = re.search(p, src, flags=re.I)
+            if m:
+                return m.group(1)
+    for psm, thr in ((6, 150), (11, 150), (6, 185), (11, 185)):
+        ws = read_words(page, dark, rect, psm=psm, lang="fra", thr=thr)
+        s = " ".join(w[4] for w in sorted(ws, key=lambda w: (round(cy(w) / 15), w[0])))
+        m = re.search(r"Sondage\s*[:;.]?\s*([A-Za-z0-9_\-/]+)", s, flags=re.I)
+        if m:
+            return m.group(1)
+        m = re.search(r"\b(S[A-Za-z]?[_\-][A-Za-z]{2,}[_\-]?[0-9OolI]{1,4})\b", s)
+        if m:
+            return m.group(1)
+    return ""
  
  
 # --------------------------------------------------------------------------- #
 # Analyse d'une page
 # --------------------------------------------------------------------------- #
 def analyze_page(page, page_no, step=1.5, assign="axe", compact_names=True):
-    words, src = get_words(page)
-    pw = page.rect.width
+    arr = render(page)
+    H, W, _ = arr.shape
+    dark = arr.min(axis=2)
+    ink = dark < 225
+    ri, gi, bi = (arr[:, :, k].astype(np.int16) for k in range(3))
+    pink = (ri >= 200) & ((ri - gi) >= 15) & ((ri - bi) >= 15)
+    gray_ink = ink & ~pink
  
-    name = format_name(detect_name(page, words, f"page_{page_no}"), compact_names)
+    # --- colonnes (lignes verticales longues)
+    lines = find_vertical_lines(ink, int(0.30 * H))
+    if len(lines) < 4:
+        raise PageSkip("colonnes de mesures introuvables (pas une coupe ?)")
+    xs = [l[0] for l in lines]
+    L = xs[-4:]
+    widths = np.diff(L)
+    if widths.min() <= 0 or widths.max() / widths.min() > 2.5:
+        raise PageSkip("colonnes Pf / Pl / Em incohérentes")
+    Wm = L[3] - L[0]
  
-    # --- en-têtes des colonnes de mesures
-    hdr = {}
-    for key in ("pf", "pl", "em"):
-        cands = [w for w in words if re.match(rf"^{key}\b", norm(w[4]))]
-        if not cands:
-            raise PageSkip("en-têtes Pf / Pl / Em introuvables")
-        hdr[key] = min(cands, key=lambda w: w[1])
-    hdr_bottom = max(w[3] for w in hdr.values())
+    lith_hi = L[0] - 0.285 * Wm
+    if len(xs) >= 6 and abs((L[0] - xs[-6]) - 0.285 * Wm) < 0.08 * Wm:
+        lith_hi = xs[-6]
+    text_lo = lith_hi - TEXT_BAND_FRAC * Wm
  
-    lith_hdr = next((w for w in words if norm(w[4]) == "lithologie"), None)
-    cpf, cpl, cem = cx(hdr["pf"]), cx(hdr["pl"]), cx(hdr["em"])
-    if not (cpf < cpl < cem):
-        raise PageSkip("ordre des colonnes Pf / Pl / Em inattendu")
-    lith_cx = cx(lith_hdr) if lith_hdr else cpf - 0.3 * pw
+    # --- cadre horizontal -> axe de profondeur
+    top, bottom = find_plot_frame(gray_ink, L[0] + 6, L[3] - 6)
  
-    # --- axe de profondeur (graduations entières dans la colonne de gauche)
-    labels = [
-        w
-        for w in words
-        if INT_RE.match(w[4]) and w[1] > hdr_bottom and cx(w) < lith_cx - 0.08 * pw
-    ]
-    uniq = {}
-    for w in labels:
-        uniq.setdefault(int(w[4]), w)
-    if len(uniq) < 3:
-        raise PageSkip("axe de profondeur introuvable")
-    depths = np.array(sorted(uniq))
-    ys = np.array([cy(uniq[d]) for d in depths])
-    a, b = np.polyfit(depths, ys, 1)  # y = a*d + b
-    if a <= 0:
-        raise PageSkip("axe de profondeur incohérent")
-    dmax = float(depths.max())
-    labels_x1 = max(w[2] for w in uniq.values())
+    # --- nombre de mètres de l'axe (via les graduations, sinon 16)
+    strip = (lith_hi - 0.78 * Wm, top - 4, lith_hi - 0.60 * Wm, bottom + 0.02 * H)
+    lab = read_words(page, dark, strip, psm=11, whitelist="0123456789", thr=150)
+    ests = []
+    for w in lab:
+        if re.fullmatch(r"\d{1,2}", w[4]) and 4 <= int(w[4]) <= 40:
+            ests.append((cy(w) - top) / int(w[4]))
+    dmax = 16.0
+    if len(ests) >= 3 and np.median(ests) > 0:
+        cand = round((bottom - top) / float(np.median(ests)))
+        if 5 <= cand <= 40:
+            dmax = float(cand)
+    a = (bottom - top) / dmax  # pixels par mètre
  
-    # --- valeurs numériques par colonne
-    half1, half2 = (cpl - cpf) / 2, (cem - cpl) / 2
-    zones = {
-        "Pf": (cpf - half1, (cpf + cpl) / 2),
-        "Pl": ((cpf + cpl) / 2, (cpl + cem) / 2),
-        "Em": ((cpl + cem) / 2, cem + half2 + 0.02 * pw),
-    }
-    y_row_lo = b - 0.15 * a
-    y_row_hi = a * dmax + b + 0.35 * a
+    # --- nom du sondage
+    chart_top = lines[-1][1]
+    name_rect = (lith_hi - 0.10 * Wm, chart_top, L[3], top)
+    raw_name = read_sondage_name(page, dark, name_rect)
+    name = format_name(raw_name, compact_names) if raw_name else f"page_{page_no}"
  
+    # --- valeurs Pf / Pl / Em
+    vrect = (L[0] + 5, top + 3, L[3] - 5, bottom - 3)
+    vws = read_words(
+        page, dark, vrect, psm=11, whitelist="0123456789.", thr=100, erase_cols=(L[1], L[2])
+    )
     pts = []
-    for w in words:
-        if not NUM_RE.match(w[4]):
+    for w in vws:
+        t = w[4].strip(".")
+        if not NUM_RE.match(t):
             continue
-        if not (y_row_lo <= cy(w) <= y_row_hi) or w[1] <= hdr_bottom:
-            continue
-        for col, (x0, x1) in zones.items():
-            if x0 <= cx(w) < x1:
-                pts.append((cy(w), col, to_float(w[4]), cx(w)))
- 
+        x = cx(w)
+        col = "Pf" if x < L[1] else ("Pl" if x < L[2] else "Em")
+        pts.append((cy(w), col, float(t), x))
     if not pts:
-        raise PageSkip("aucune valeur Pf / Pl / Em détectée")
+        raise PageSkip("aucune valeur détectée")
  
     rows = []
-    for g in cluster_1d(pts, key=lambda p: p[0], tol=0.4 * a):
-        row = {"y": float(np.mean([p[0] for p in g]))}
+    for grp in cluster_1d(pts, key=lambda p: p[0], tol=0.4 * a):
+        row = {"y": float(np.mean([p[0] for p in grp]))}
         for col in ("Pf", "Pl", "Em"):
-            c = sorted([p for p in g if p[1] == col], key=lambda p: p[3])
+            c = sorted([p for p in grp if p[1] == col], key=lambda p: p[3])
             row[col] = c[0][2] if c else np.nan
         rows.append(row)
  
-    # --- profondeur de chaque essai (grille de `step` mètres)
-    est = [(r["y"] - b) / a for r in rows]
-    ks = [max(1, int(round(e / step))) for e in est]
+    # --- profondeur de chaque essai (grille de `step` m)
+    ks = [max(1, int(round(((r_["y"] - top) / a) / step))) for r_ in rows]
     if len(set(ks)) == len(ks) and ks == sorted(ks):
         depth_list = [k * step for k in ks]
-    else:  # repli : on numérote dans l'ordre
+    else:
         depth_list = [(i + 1) * step for i in range(len(rows))]
  
     # --- couches de lithologie
-    y_lo = (lith_hdr[3] + 2) if lith_hdr else (b - 0.5 * a)
-    y_hi = a * dmax + b + 0.2 * a
-    x_text_lo = labels_x1 + 2
-    x_text_hi = lith_cx + 0.11 * pw
- 
-    lith_words = [
-        w
-        for w in words
-        if x_text_lo <= cx(w) <= x_text_hi
-        and y_lo <= cy(w) <= y_hi
-        and re.search(r"[A-Za-zÀ-ÿ]", w[4])
-        and "neant" not in norm(w[4])
+    bnds = [
+        y
+        for y in detect_boundaries(arr, lith_hi - 0.50 * Wm, lith_hi - 0.05 * Wm, top, bottom)
+        if top + 0.1 * a < y < bottom - 0.1 * a
     ]
- 
-    bnds = detect_boundaries(page, lith_cx - 0.06 * pw, lith_cx + 0.06 * pw, y_lo, y_hi)
-    method = "traits"
-    if bnds:
-        edges = [y_lo] + sorted(bnds) + [y_hi]
-    else:
-        method = "milieux"
-        if lith_words:
-            h = float(np.median([w[3] - w[1] for w in lith_words])) or 1.0
-            grp = cluster_1d(lith_words, cy, 1.6 * h)
-            centers = [float(np.mean([cy(w) for w in g])) for g in grp]
-            mids = [(centers[i] + centers[i + 1]) / 2 for i in range(len(centers) - 1)]
-            edges = [y_lo] + mids + [y_hi]
-        else:
-            edges = [y_lo, y_hi]
- 
+    edges = [top] + sorted(bnds) + [bottom]
     layers = []
     for t, bt in zip(edges[:-1], edges[1:]):
-        layers.append(join_words([w for w in lith_words if t <= cy(w) < bt]))
+        rect = (text_lo, t + 2, lith_hi - 3, bt - 2)
+        ws = read_words(page, dark, rect, psm=6, lang="fra", thr=150)
+        layers.append(clean_label(join_words(ws)))
  
     # --- assemblage
     out = []
-    for r, d in zip(rows, depth_list):
-        ypos = (a * d + b) if assign == "axe" else r["y"]
-        idx = sum(1 for e in edges[1:-1] if e < ypos)
-        idx = min(idx, len(layers) - 1)
+    for r_, d in zip(rows, depth_list):
+        ypos = (top + a * d) if assign == "axe" else r_["y"]
+        idx = min(sum(1 for e in edges[1:-1] if e < ypos), len(layers) - 1)
         out.append(
             {
                 "Nom du sondage": name,
                 "Profondeur (m)": d,
                 "Lithologie": layers[idx],
-                "Pf (MPa)": r["Pf"],
-                "Pl* (MPa)": r["Pl"],
-                "Em (MPa)": r["Em"],
+                "Pf (MPa)": r_["Pf"],
+                "Pl* (MPa)": r_["Pl"],
+                "Em (MPa)": r_["Em"],
             }
         )
  
     info = {
         "page": page_no,
         "sondage": name,
-        "source": src,
+        "source": "ocr" if not native_words(page, vrect) else "texte",
         "essais": len(rows),
-        "limites": method,
+        "limites": f"{len(bnds)} trait(s)",
         "couches": layers,
     }
     return out, info
  
  
 # --------------------------------------------------------------------------- #
-# Traitement d'un PDF complet
+# PDF complet
 # --------------------------------------------------------------------------- #
+def snap_labels(df, min_count=20, cutoff=0.8):
+    """Corrige les petites erreurs d'OCR en alignant sur les libellés fréquents."""
+    if df.empty:
+        return df
+    cnt = Counter(df.loc[df["Lithologie"] != "", "Lithologie"])
+    frequent = [l for l, c in cnt.most_common() if c >= min_count]
+ 
+    def fix(l):
+        if not l or l in frequent:
+            return l
+        m = difflib.get_close_matches(l, frequent, n=1, cutoff=cutoff)
+        return m[0] if m else l
+ 
+    df = df.copy()
+    df["Lithologie"] = df["Lithologie"].map(fix)
+    return df
+ 
+ 
 def process_pdf(pdf_bytes, step=1.5, assign="axe", compact_names=True, progress=None):
+    if not OCR_AVAILABLE:
+        raise RuntimeError("pytesseract / Pillow non installés (voir requirements.txt et packages.txt).")
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     all_rows, infos, skipped = [], [], []
     n = len(doc)
@@ -315,12 +381,14 @@ def process_pdf(pdf_bytes, step=1.5, assign="axe", compact_names=True, progress=
             infos.append(info)
         except PageSkip as e:
             skipped.append((i + 1, str(e)))
-        except Exception as e:  # une page défaillante ne bloque pas le reste
+        except Exception as e:
             skipped.append((i + 1, f"erreur : {e}"))
         if progress:
             progress((i + 1) / n)
     doc.close()
-    return pd.DataFrame(all_rows), infos, skipped
+    df = pd.DataFrame(all_rows)
+    df = snap_labels(df)
+    return df, infos, skipped
  
  
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
